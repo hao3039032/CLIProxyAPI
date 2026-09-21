@@ -60,7 +60,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body, chainParentRespID := helps.RepairCodexResponsesChainInputWithParent(body)
+	var chainParentRespID string
+	var chainMissingRespID string
+	body, chainParentRespID, chainMissingRespID = helps.RepairCodexResponsesChainInputWithResult(body)
+	if chainMissingRespID != "" {
+		code, errBody := helps.NewCodexResponsesChainMissingStatusErr(chainMissingRespID)
+		return nil, statusErr{code: code, msg: string(errBody)}
+	}
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.DeleteBytes(body, "generate")
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")

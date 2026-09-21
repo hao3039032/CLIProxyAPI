@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -60,8 +61,11 @@ const (
 	// survive container recreation should volume-mount it.
 	codexResponsesChainCacheDir = "responses-chain-cache"
 
-	// codexResponsesChainDiskExt is the compressed snapshot file extension.
-	codexResponsesChainDiskExt = ".json.gz"
+	// codexResponsesChainDiskExt is the compressed snapshot file extension;
+	// codexResponsesChainDiskLegacyExt covers files written before the zstd
+	// switch and is still readable and swept.
+	codexResponsesChainDiskExt       = ".json.zst"
+	codexResponsesChainDiskLegacyExt = ".json.gz"
 )
 
 // codexResponsesChainNow is injectable so TTL behaviour is testable without
@@ -74,6 +78,20 @@ var codexResponsesChainNow = time.Now
 var codexResponsesChainDir = codexResponsesChainCacheDir
 
 var codexResponsesChainLastSweep time.Time
+
+var (
+	codexResponsesChainZstdEncoder *zstd.Encoder
+	codexResponsesChainZstdDecoder *zstd.Decoder
+)
+
+func init() {
+	if encoder, errEncoder := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest)); errEncoder == nil {
+		codexResponsesChainZstdEncoder = encoder
+	}
+	if decoder, errDecoder := zstd.NewReader(nil); errDecoder == nil {
+		codexResponsesChainZstdDecoder = decoder
+	}
+}
 
 type codexResponsesChainEntry struct {
 	inputItems  [][]byte
@@ -187,7 +205,7 @@ func RecordCodexResponsesChainSnapshot(upstreamBody, completedData []byte, repla
 // cached items are returned unchanged. The previous_response_id field itself
 // is left in place for the caller to remove.
 func RepairCodexResponsesChainInput(body []byte) []byte {
-	updated, _ := RepairCodexResponsesChainInputWithParent(body)
+	updated, _, _ := RepairCodexResponsesChainInputWithResult(body)
 	return updated
 }
 
@@ -196,29 +214,40 @@ func RepairCodexResponsesChainInput(body []byte) []byte {
 // snapshot was consumed to rebuild the input, so the caller can fold it away
 // once this turn's response completes.
 func RepairCodexResponsesChainInputWithParent(body []byte) ([]byte, string) {
+	updated, parent, _ := RepairCodexResponsesChainInputWithResult(body)
+	return updated, parent
+}
+
+// RepairCodexResponsesChainInputWithResult additionally returns the resp id
+// of a missing snapshot: the request relies on previous_response_id chaining
+// but neither cache tier holds that id. The Codex upstream is stateless, so
+// forwarding such a request can only fail with an orphaned-tool-call
+// rejection; callers that can surface an error to the client should return a
+// previous_response_not_found response instead of forwarding.
+func RepairCodexResponsesChainInputWithResult(body []byte) (updated []byte, parentRespID, missingRespID string) {
 	if len(body) == 0 {
-		return body, ""
+		return body, "", ""
 	}
 	previous := gjson.GetBytes(body, "previous_response_id")
 	if previous.Type != gjson.String {
-		return body, ""
+		return body, "", ""
 	}
 	respID := strings.TrimSpace(previous.String())
 	if respID == "" {
-		return body, ""
+		return body, "", ""
 	}
 	entry, ok := lookupCodexResponsesChainEntry(respID)
 	if !ok {
 		log.Infof("codex responses chain: cache miss for previous_response_id=%s", respID)
-		return body, ""
+		return body, "", respID
 	}
 	input := util.GetGJSONBytesNoCopy(body, "input")
 	if !input.Exists() || !input.IsArray() {
-		return body, ""
+		return body, "", ""
 	}
 	items := input.Array()
 	if codexResponsesChainInputAlreadyReplayed(entry.outputItems, items) {
-		return body, ""
+		return body, "", ""
 	}
 	rebuilt := make([][]byte, 0, len(entry.inputItems)+len(entry.outputItems)+len(items))
 	rebuilt = append(rebuilt, entry.inputItems...)
@@ -235,10 +264,24 @@ func RepairCodexResponsesChainInputWithParent(body []byte) ([]byte, string) {
 	rebuilt = dedupeCodexResponsesChainItemsByID(rebuilt)
 	updated, errSet := sjson.SetRawBytes(body, "input", codexResponsesChainJoinItems(rebuilt))
 	if errSet != nil {
-		return body, ""
+		return body, "", ""
 	}
 	log.Infof("codex responses chain: rebuilt input for previous_response_id=%s cachedInput=%d cachedOutput=%d newItems=%d rebuilt=%d", respID, len(entry.inputItems), len(entry.outputItems), len(items), len(rebuilt))
-	return updated, respID
+	return updated, respID, ""
+}
+
+// NewCodexResponsesChainMissingStatusErr builds the client-facing error for
+// ErrCodexResponsesChainSnapshotMissing: an actionable 400 whose code and
+// param let chaining clients (e.g. LangChain agents) detect the stale id and
+// retry with the full conversation history.
+func NewCodexResponsesChainMissingStatusErr(missingRespID string) (int, []byte) {
+	body, errBuild := sjson.SetBytes([]byte(`{"error":{}}`), "error.code", "previous_response_not_found")
+	if errBuild == nil {
+		body, _ = sjson.SetBytes(body, "error.type", "invalid_request_error")
+		body, _ = sjson.SetBytes(body, "error.param", "previous_response_id")
+		body, _ = sjson.SetBytes(body, "error.message", "No cached response found for previous_response_id '"+missingRespID+"'. This proxy forwards statelessly; after cache expiry or a restart the stored continuation is gone. Resend the full conversation input without previous_response_id to continue.")
+	}
+	return 400, body
 }
 
 // ClearCodexResponsesChainCache resets all in-memory and on-disk snapshots.
@@ -250,8 +293,9 @@ func ClearCodexResponsesChainCache() {
 	codexResponsesChainMu.Unlock()
 	if entries, errList := os.ReadDir(codexResponsesChainDir); errList == nil {
 		for _, entry := range entries {
-			if strings.HasSuffix(entry.Name(), codexResponsesChainDiskExt) {
-				_ = os.Remove(filepath.Join(codexResponsesChainDir, entry.Name()))
+			name := entry.Name()
+			if strings.HasSuffix(name, codexResponsesChainDiskExt) || strings.HasSuffix(name, codexResponsesChainDiskLegacyExt) {
+				_ = os.Remove(filepath.Join(codexResponsesChainDir, name))
 			}
 		}
 	}
@@ -374,20 +418,19 @@ func writeCodexResponsesChainDisk(respID string, inputItems, outputItems [][]byt
 		return
 	}
 	record := codexResponsesChainDiskRecord{Input: inputItems, Output: outputItems, RecordedAt: now.Unix()}
-	var compressed bytes.Buffer
-	gzipWriter, errWriter := gzip.NewWriterLevel(&compressed, gzip.BestSpeed)
-	if errWriter != nil {
+	payload, errMarshal := json.Marshal(record)
+	if errMarshal != nil {
 		return
 	}
-	if errEncode := json.NewEncoder(gzipWriter).Encode(record); errEncode != nil {
-		return
-	}
-	if errClose := gzipWriter.Close(); errClose != nil {
-		return
+	var compressed []byte
+	if codexResponsesChainZstdEncoder != nil {
+		compressed = codexResponsesChainZstdEncoder.EncodeAll(payload, nil)
+	} else {
+		compressed = codexResponsesChainGzipCompress(payload)
 	}
 	path := filepath.Join(codexResponsesChainDir, respID+codexResponsesChainDiskExt)
 	tmp := path + ".tmp"
-	if errWrite := os.WriteFile(tmp, compressed.Bytes(), 0o600); errWrite != nil {
+	if errWrite := os.WriteFile(tmp, compressed, 0o600); errWrite != nil {
 		return
 	}
 	if errRename := os.Rename(tmp, path); errRename != nil {
@@ -396,24 +439,61 @@ func writeCodexResponsesChainDisk(respID string, inputItems, outputItems [][]byt
 	}
 }
 
+func codexResponsesChainGzipCompress(payload []byte) []byte {
+	var buf bytes.Buffer
+	gzipWriter, errWriter := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	if errWriter != nil {
+		return nil
+	}
+	if _, errWrite := gzipWriter.Write(payload); errWrite != nil {
+		return nil
+	}
+	if errClose := gzipWriter.Close(); errClose != nil {
+		return nil
+	}
+	return buf.Bytes()
+}
+
+// codexResponsesChainDecompress accepts both zstd and gzip payloads so files
+// written before the zstd switch remain readable until their TTL expires.
+func codexResponsesChainDecompress(raw []byte) ([]byte, bool) {
+	if len(raw) >= 4 && raw[0] == 0x28 && raw[1] == 0xB5 && raw[2] == 0x2F && raw[3] == 0xFD {
+		if codexResponsesChainZstdDecoder == nil {
+			return nil, false
+		}
+		decoded, errDecode := codexResponsesChainZstdDecoder.DecodeAll(raw, nil)
+		if errDecode != nil {
+			return nil, false
+		}
+		return decoded, true
+	}
+	gzipReader, errGzip := gzip.NewReader(bytes.NewReader(raw))
+	if errGzip != nil {
+		return nil, false
+	}
+	decoded, errAll := io.ReadAll(gzipReader)
+	_ = gzipReader.Close()
+	if errAll != nil {
+		return nil, false
+	}
+	return decoded, true
+}
+
 func readCodexResponsesChainDisk(respID string, now time.Time) (codexResponsesChainDiskRecord, bool) {
 	if !codexResponsesChainSafeFileName(respID) {
 		return codexResponsesChainDiskRecord{}, false
 	}
 	path := filepath.Join(codexResponsesChainDir, respID+codexResponsesChainDiskExt)
+	if _, errStat := os.Stat(path); errStat != nil {
+		path = filepath.Join(codexResponsesChainDir, respID+codexResponsesChainDiskLegacyExt)
+	}
 	remove := func() { _ = os.Remove(path) }
 	raw, errRead := os.ReadFile(path)
 	if errRead != nil {
 		return codexResponsesChainDiskRecord{}, false
 	}
-	gzipReader, errGzip := gzip.NewReader(bytes.NewReader(raw))
-	if errGzip != nil {
-		remove()
-		return codexResponsesChainDiskRecord{}, false
-	}
-	payload, errAll := io.ReadAll(gzipReader)
-	_ = gzipReader.Close()
-	if errAll != nil {
+	payload, okDecompress := codexResponsesChainDecompress(raw)
+	if !okDecompress {
 		remove()
 		return codexResponsesChainDiskRecord{}, false
 	}
@@ -438,6 +518,7 @@ func deleteCodexResponsesChainDisk(respID string) {
 		return
 	}
 	_ = os.Remove(filepath.Join(codexResponsesChainDir, respID+codexResponsesChainDiskExt))
+	_ = os.Remove(filepath.Join(codexResponsesChainDir, respID+codexResponsesChainDiskLegacyExt))
 }
 
 // sweepCodexResponsesChainLocked removes expired memory entries and, at a
@@ -476,7 +557,7 @@ func sweepCodexResponsesChainDisk(now time.Time) {
 	var totalBytes int64
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasSuffix(name, codexResponsesChainDiskExt) {
+		if !strings.HasSuffix(name, codexResponsesChainDiskExt) && !strings.HasSuffix(name, codexResponsesChainDiskLegacyExt) {
 			continue
 		}
 		info, errInfo := entry.Info()

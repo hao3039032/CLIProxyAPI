@@ -23,13 +23,18 @@ const (
 	// CodexResponsesChainCacheTTL bounds how long a completed response stays
 	// eligible for previous_response_id reconstruction in process memory.
 	// Access refreshes the entry so active conversations survive long tool
-	// loops.
-	CodexResponsesChainCacheTTL = 1 * time.Hour
+	// loops. OpenAI-style chaining loses its cached-prefix benefit after ~30
+	// minutes idle (clients such as the agent's ResponsesChainBreakMiddleware
+	// break the chain at exactly 1800s), so retention past that window buys
+	// nothing; the extra buffer avoids boundary races with client-side
+	// break thresholds.
+	CodexResponsesChainCacheTTL = 35 * time.Minute
 
-	// CodexResponsesChainDiskTTL bounds on-disk snapshot retention; it is
-	// longer than the memory TTL so conversations that idle past a deploy or
-	// a memory eviction can still be reconstructed.
-	CodexResponsesChainDiskTTL = 24 * time.Hour
+	// CodexResponsesChainDiskTTL bounds on-disk snapshot retention; it only
+	// needs to outlive deploys and restarts (minutes) plus the memory TTL,
+	// so a couple of hours is ample while cutting sensitive transcript
+	// retention to a minimum.
+	CodexResponsesChainDiskTTL = 2 * time.Hour
 
 	// CodexResponsesChainCacheMaxEntries bounds the number of in-memory
 	// snapshots; the global byte budget is the primary memory limiter.

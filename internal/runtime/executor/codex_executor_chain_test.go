@@ -162,30 +162,58 @@ func TestCodexExecutorExecuteStreamRebuildsPreviousResponseChain(t *testing.T) {
 	assertCodexChainRebuiltSecondRequest(t, requests)
 }
 
-func TestCodexExecutorExecuteChainCacheMissForwardsIncremental(t *testing.T) {
+func TestCodexExecutorExecuteChainCacheMissReturnsPreviousResponseNotFound(t *testing.T) {
 	executor, auth, requests := newCodexChainFixture(t)
 
 	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.4",
 		Payload: []byte(`{"model":"gpt-5.4","previous_response_id":"resp_missing","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`),
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: false})
-	if err != nil {
-		t.Fatalf("Execute error: %v", err)
+	if err == nil {
+		t.Fatalf("expected error for missing snapshot")
 	}
+	statusErr, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("error %T lacks StatusCode", err)
+	}
+	if code := statusErr.StatusCode(); code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", code)
+	}
+	body := err.Error()
+	if got := gjson.Get(body, "error.code").String(); got != "previous_response_not_found" {
+		t.Fatalf("error.code = %q, want previous_response_not_found (body: %s)", got, body)
+	}
+	if got := gjson.Get(body, "error.param").String(); got != "previous_response_id" {
+		t.Fatalf("error.param = %q, want previous_response_id", got)
+	}
+	// The broken request must not be forwarded upstream.
+	if requests != nil && len(*requests) != 0 {
+		t.Fatalf("upstream requests = %d, want 0", len(*requests))
+	}
+}
 
-	if requests == nil || len(*requests) != 1 {
-		t.Fatalf("upstream requests = %d, want 1", len(*requests))
+func TestCodexExecutorExecuteStreamChainCacheMissReturnsPreviousResponseNotFound(t *testing.T) {
+	executor, auth, requests := newCodexChainFixture(t)
+
+	_, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","previous_response_id":"resp_missing","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: true})
+	if err == nil {
+		t.Fatalf("expected error for missing snapshot")
 	}
-	first := (*requests)[0]
-	if gjson.GetBytes(first, "previous_response_id").Exists() {
-		t.Fatalf("previous_response_id forwarded upstream: %s", first)
+	statusErr, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("error %T lacks StatusCode", err)
 	}
-	items := gjson.GetBytes(first, "input").Array()
-	if len(items) != 1 {
-		t.Fatalf("input items = %d, want unchanged single item: %s", len(items), first)
+	if code := statusErr.StatusCode(); code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", code)
 	}
-	if got := items[0].Get("type").String(); got != "function_call_output" {
-		t.Fatalf("items[0].type = %q, want function_call_output", got)
+	if got := gjson.Get(err.Error(), "error.code").String(); got != "previous_response_not_found" {
+		t.Fatalf("error.code = %q, want previous_response_not_found", got)
+	}
+	if requests != nil && len(*requests) != 0 {
+		t.Fatalf("upstream requests = %d, want 0", len(*requests))
 	}
 }
 
@@ -307,23 +335,27 @@ func TestCodexExecutorExecuteDoesNotRecordIncompleteResponse(t *testing.T) {
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: false}); err != nil {
 		t.Fatalf("turn 1 Execute error: %v", err)
 	}
-	if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.4",
 		Payload: []byte(`{"model":"gpt-5.4","previous_response_id":"resp_inc","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`),
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: false}); err != nil {
-		t.Fatalf("turn 2 Execute error: %v", err)
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: false})
+	if err == nil {
+		t.Fatalf("expected previous_response_not_found for unanchored chain")
 	}
-
-	if len(*requests) != 2 {
-		t.Fatalf("upstream requests = %d, want 2", len(*requests))
+	statusErr, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("turn 2 error %T lacks StatusCode: %v", err, err)
 	}
-	second := (*requests)[1]
-	if gjson.GetBytes(second, "previous_response_id").Exists() {
-		t.Fatalf("previous_response_id forwarded upstream: %s", second)
+	if code := statusErr.StatusCode(); code != http.StatusBadRequest {
+		t.Fatalf("turn 2 status = %d, want 400", code)
 	}
-	items := gjson.GetBytes(second, "input").Array()
-	if len(items) != 1 {
-		t.Fatalf("input items = %d, want 1 (incomplete responses must not anchor chains): %s", len(items), second)
+	if got := gjson.Get(err.Error(), "error.code").String(); got != "previous_response_not_found" {
+		t.Fatalf("turn 2 error.code = %q, want previous_response_not_found", got)
+	}
+	// The incomplete response never anchored a chain snapshot, so the second
+	// turn must not even reach the upstream with an orphaned tool output.
+	if len(*requests) != 1 {
+		t.Fatalf("upstream requests = %d, want 1", len(*requests))
 	}
 }
 

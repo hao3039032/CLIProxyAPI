@@ -158,7 +158,14 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts, auth))
 	helps.SetStringIfDifferentDoc(doc, "model", baseModel)
 	helps.SetBoolIfDifferentDoc(doc, "stream", true)
-	body, chainParentRespID := helps.RepairCodexResponsesChainInputWithParent(doc.Bytes())
+	var chainParentRespID string
+	var chainMissingRespID string
+	body, chainParentRespID, chainMissingRespID = helps.RepairCodexResponsesChainInputWithResult(doc.Bytes())
+	if chainMissingRespID != "" {
+		code, errBody := helps.NewCodexResponsesChainMissingStatusErr(chainMissingRespID)
+		err = statusErr{code: code, msg: string(errBody)}
+		return resp, err
+	}
 	doc = ojson.NewDoc(body)
 	_ = doc.Delete("previous_response_id")
 	_ = doc.Delete("generate")

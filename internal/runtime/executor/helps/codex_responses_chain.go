@@ -35,15 +35,16 @@ const (
 	CodexResponsesChainCacheMaxEntries = 1024
 
 	// CodexResponsesChainCacheMaxBytesPerEntry skips oversized conversations
-	// instead of trying to store a single huge transcript. Image-heavy
-	// transcripts embed multi-MB base64 blocks per turn, so this must
-	// comfortably exceed a full agent session (observed ~10MB turn-1).
-	CodexResponsesChainCacheMaxBytesPerEntry = 64 << 20 // 64MB
+	// instead of trying to store a single huge transcript. Must exceed the
+	// largest accepted request: gateways in front of this proxy allow ~100MB
+	// single requests, and image-heavy transcripts embed multi-MB base64
+	// blocks per turn (observed ~10MB turn-1, ceiling ~100MB).
+	CodexResponsesChainCacheMaxBytesPerEntry = 128 << 20 // 128MB
 
 	// CodexResponsesChainCacheMaxTotalBytes bounds the in-memory hot cache.
 	// The on-disk store is the authoritative tier; memory only accelerates
 	// lookups.
-	CodexResponsesChainCacheMaxTotalBytes = 256 << 20 // 256MB
+	CodexResponsesChainCacheMaxTotalBytes = 512 << 20 // 512MB
 
 	// CodexResponsesChainDiskMaxTotalBytes bounds total on-disk snapshot
 	// bytes; the throttled sweep deletes the oldest files beyond it.

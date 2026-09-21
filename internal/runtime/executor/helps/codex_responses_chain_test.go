@@ -3,6 +3,8 @@ package helps
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -11,10 +13,17 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func resetCodexResponsesChainForTest(t *testing.T) {
+func resetCodexResponsesChainForTest(t *testing.T) string {
 	t.Helper()
 	ClearCodexResponsesChainCache()
-	t.Cleanup(ClearCodexResponsesChainCache)
+	originalDir := codexResponsesChainDir
+	dir := t.TempDir()
+	codexResponsesChainDir = dir
+	t.Cleanup(func() {
+		codexResponsesChainDir = originalDir
+		ClearCodexResponsesChainCache()
+	})
+	return dir
 }
 
 func withCodexResponsesChainClock(t *testing.T, start time.Time) func(advance time.Duration) {
@@ -25,6 +34,15 @@ func withCodexResponsesChainClock(t *testing.T, start time.Time) func(advance ti
 	advance := func(d time.Duration) { current = current.Add(d) }
 	t.Cleanup(func() { codexResponsesChainNow = original })
 	return advance
+}
+
+// wipeCodexResponsesChainMemoryForTest simulates a process restart by
+// dropping only the in-memory tier; the on-disk store survives.
+func wipeCodexResponsesChainMemoryForTest() {
+	codexResponsesChainMu.Lock()
+	codexResponsesChainEntries = make(map[string]*codexResponsesChainEntry)
+	codexResponsesChainTotalBytes = 0
+	codexResponsesChainMu.Unlock()
 }
 
 const codexResponsesChainUpstreamBody = `{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"weather in SF?"}]}]}`
@@ -155,28 +173,150 @@ func TestRepairCodexResponsesChainInputRebuildsWithEchoedReasoningAndDedupes(t *
 	}
 }
 
-func TestCodexResponsesChainCacheTTLExpiryAndRefresh(t *testing.T) {
+func TestCodexResponsesChainLayeredTTLMemoryThenDiskThenExpiry(t *testing.T) {
 	resetCodexResponsesChainForTest(t)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	advance := withCodexResponsesChainClock(t, base)
 
 	RecordCodexResponsesChainSnapshot([]byte(codexResponsesChainUpstreamBody), []byte(codexResponsesChainCompleted))
-	advance(CodexResponsesChainCacheTTL - time.Second)
-
 	incremental := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_1","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
-	if updated := RepairCodexResponsesChainInput(incremental); bytes.Equal(updated, incremental) {
-		t.Fatalf("expected rebuild before TTL expiry")
-	}
 
-	// The successful lookup refreshed lastSeen; the entry survives an hour
-	// measured from the refresh point, then expires.
+	// Within the memory TTL the hot cache serves the rebuild and refreshes.
 	advance(CodexResponsesChainCacheTTL - time.Second)
 	if updated := RepairCodexResponsesChainInput(incremental); bytes.Equal(updated, incremental) {
-		t.Fatalf("expected rebuild after refresh")
+		t.Fatalf("expected rebuild from memory")
 	}
-	advance(CodexResponsesChainCacheTTL + time.Second)
+
+	// Once the memory entry expires, the on-disk tier (24h TTL) still serves.
+	wipeCodexResponsesChainMemoryForTest()
+	advance(CodexResponsesChainDiskTTL - CodexResponsesChainCacheTTL)
+	if updated := RepairCodexResponsesChainInput(incremental); bytes.Equal(updated, incremental) {
+		t.Fatalf("expected rebuild from disk after memory expiry")
+	}
+
+	// Past the disk TTL the snapshot is gone for good.
+	wipeCodexResponsesChainMemoryForTest()
+	advance(2 * time.Minute)
 	if updated := RepairCodexResponsesChainInput(incremental); !bytes.Equal(updated, incremental) {
-		t.Fatalf("expected miss after TTL expiry, got %s", updated)
+		t.Fatalf("expected miss after disk TTL expiry, got %s", updated)
+	}
+}
+
+func TestCodexResponsesChainSurvivesMemoryResetViaDisk(t *testing.T) {
+	resetCodexResponsesChainForTest(t)
+	RecordCodexResponsesChainSnapshot([]byte(codexResponsesChainUpstreamBody), []byte(codexResponsesChainCompleted))
+
+	// Simulate a process restart: memory tier is empty, disk tier survives.
+	wipeCodexResponsesChainMemoryForTest()
+
+	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_1","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
+	updated := RepairCodexResponsesChainInput(body)
+	items := gjson.GetBytes(updated, "input").Array()
+	if len(items) != 3 {
+		t.Fatalf("input items = %d, want 3 after disk recovery: %s", len(items), updated)
+	}
+	// The promotion re-populates the memory tier.
+	codexResponsesChainMu.Lock()
+	_, promoted := codexResponsesChainEntries["resp_1"]
+	codexResponsesChainMu.Unlock()
+	if !promoted {
+		t.Fatalf("expected disk hit to promote the entry into memory")
+	}
+}
+
+func TestCodexResponsesChainFoldDeletesParentOnDiskAndMemory(t *testing.T) {
+	resetCodexResponsesChainForTest(t)
+	RecordCodexResponsesChainSnapshot([]byte(codexResponsesChainUpstreamBody), []byte(codexResponsesChainCompleted))
+
+	turn2Upstream := []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"weather in SF?"}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
+	turn2Completed := `{"type":"response.completed","response":{"id":"resp_2","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Sunny."}]}]}}`
+	RecordCodexResponsesChainSnapshot(turn2Upstream, []byte(turn2Completed), "resp_1")
+
+	if _, errStat := os.Stat(filepath.Join(codexResponsesChainDir, "resp_1"+codexResponsesChainDiskExt)); !os.IsNotExist(errStat) {
+		t.Fatalf("parent disk file should be folded away: %v", errStat)
+	}
+	if _, errStat := os.Stat(filepath.Join(codexResponsesChainDir, "resp_2"+codexResponsesChainDiskExt)); errStat != nil {
+		t.Fatalf("child disk file should exist: %v", errStat)
+	}
+	codexResponsesChainMu.Lock()
+	_, parentInMemory := codexResponsesChainEntries["resp_1"]
+	_, childInMemory := codexResponsesChainEntries["resp_2"]
+	codexResponsesChainMu.Unlock()
+	if parentInMemory {
+		t.Fatalf("parent memory entry should be folded away")
+	}
+	if !childInMemory {
+		t.Fatalf("child memory entry should exist")
+	}
+
+	// Repair with the folded parent id must now miss (upstream requests
+	// referencing dead ancestors behave exactly like before the fix).
+	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_1","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
+	if updated := RepairCodexResponsesChainInput(body); !bytes.Equal(updated, body) {
+		t.Fatalf("body changed for folded parent: %s", updated)
+	}
+}
+
+func TestCodexResponsesChainDiskFileIsCompressed(t *testing.T) {
+	dir := resetCodexResponsesChainForTest(t)
+	bigText := strings.Repeat("compressible storyboard workflow notes. ", 50_000)
+	upstreamBody := []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"` + bigText + `"}]}]}`)
+	completed := []byte(`{"type":"response.completed","response":{"id":"resp_big","output":[{"type":"message","id":"msg_1","content":[{"type":"output_text","text":"ok"}]}]}}`)
+	RecordCodexResponsesChainSnapshot(upstreamBody, completed)
+
+	info, errStat := os.Stat(filepath.Join(dir, "resp_big"+codexResponsesChainDiskExt))
+	if errStat != nil {
+		t.Fatalf("compressed snapshot file missing: %v", errStat)
+	}
+	rawBytes := int64(len(upstreamBody) + len(completed))
+	if info.Size() >= rawBytes/4 {
+		t.Fatalf("compressed file size = %d, want < 25%% of raw %d", info.Size(), rawBytes)
+	}
+
+	// The compressed file still round-trips through a rebuild.
+	wipeCodexResponsesChainMemoryForTest()
+	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_big","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"again"}]}]}`)
+	updated := RepairCodexResponsesChainInput(body)
+	items := gjson.GetBytes(updated, "input").Array()
+	if len(items) != 3 {
+		t.Fatalf("input items = %d, want 3 (cached user, cached output, new user) after compressed disk recovery", len(items))
+	}
+	if len(items[0].Get("content.0.text").String()) != len(bigText) {
+		t.Fatalf("recovered user message text length mismatch")
+	}
+}
+
+func TestCodexResponsesChainDiskCorruptFileIgnored(t *testing.T) {
+	dir := resetCodexResponsesChainForTest(t)
+	RecordCodexResponsesChainSnapshot([]byte(codexResponsesChainUpstreamBody), []byte(codexResponsesChainCompleted))
+	wipeCodexResponsesChainMemoryForTest()
+
+	path := filepath.Join(dir, "resp_1"+codexResponsesChainDiskExt)
+	if errWrite := os.WriteFile(path, []byte("not gzip at all"), 0o600); errWrite != nil {
+		t.Fatalf("write corrupt file: %v", errWrite)
+	}
+
+	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_1","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
+	if updated := RepairCodexResponsesChainInput(body); !bytes.Equal(updated, body) {
+		t.Fatalf("body changed for corrupt disk file: %s", updated)
+	}
+	if _, errStat := os.Stat(path); !os.IsNotExist(errStat) {
+		t.Fatalf("corrupt file should be removed, stat err = %v", errStat)
+	}
+}
+
+func TestCodexResponsesChainDiskSweepRemovesExpiredFiles(t *testing.T) {
+	resetCodexResponsesChainForTest(t)
+	RecordCodexResponsesChainSnapshot([]byte(codexResponsesChainUpstreamBody), []byte(codexResponsesChainCompleted))
+	path := filepath.Join(codexResponsesChainDir, "resp_1"+codexResponsesChainDiskExt)
+	expired := codexResponsesChainNow().Add(-CodexResponsesChainDiskTTL - time.Minute)
+	if errTouch := os.Chtimes(path, expired, expired); errTouch != nil {
+		t.Fatalf("chtimes: %v", errTouch)
+	}
+
+	sweepCodexResponsesChainDisk(codexResponsesChainNow())
+	if _, errStat := os.Stat(path); !os.IsNotExist(errStat) {
+		t.Fatalf("expired disk file should be swept, stat err = %v", errStat)
 	}
 }
 
@@ -189,6 +329,9 @@ func TestRecordCodexResponsesChainSnapshotSkipsOversizedEntry(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_big","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
 	if updated := RepairCodexResponsesChainInput(body); !bytes.Equal(updated, body) {
 		t.Fatalf("oversized snapshot was recorded: %s", updated)
+	}
+	if _, errStat := os.Stat(filepath.Join(codexResponsesChainDir, "resp_big"+codexResponsesChainDiskExt)); !os.IsNotExist(errStat) {
+		t.Fatalf("oversized snapshot should not be written to disk")
 	}
 }
 
@@ -222,7 +365,7 @@ func TestCodexResponsesChainCacheEvictsBeyondMaxEntries(t *testing.T) {
 	advance := withCodexResponsesChainClock(t, base)
 
 	upstreamBody := []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
-	total := CodexResponsesChainCacheMaxEntries + codexResponsesChainCacheEvictBatchSize + 8
+	total := CodexResponsesChainCacheMaxEntries + 8
 	for i := 0; i < total; i++ {
 		completed := fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp_%d","output":[{"type":"message","id":"msg_%d","content":[{"type":"output_text","text":"ok"}]}]}}`, i, i)
 		RecordCodexResponsesChainSnapshot(upstreamBody, []byte(completed))
@@ -230,21 +373,15 @@ func TestCodexResponsesChainCacheEvictsBeyondMaxEntries(t *testing.T) {
 	}
 
 	first := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_0","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
-	if updated := RepairCodexResponsesChainInput(first); !bytes.Equal(updated, first) {
-		t.Fatalf("oldest entry was not evicted")
-	}
-
-	last := []byte(fmt.Sprintf(`{"model":"gpt-5.4","previous_response_id":"resp_%d","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`, total-1))
-	if updated := RepairCodexResponsesChainInput(last); bytes.Equal(updated, last) {
-		t.Fatalf("newest entry was evicted")
-	}
-
+	// resp_0 is evicted from memory but its disk file survives; wipe memory
+	// is not needed - assert only the in-memory bound here.
 	codexResponsesChainMu.Lock()
 	entries := len(codexResponsesChainEntries)
 	codexResponsesChainMu.Unlock()
 	if entries > CodexResponsesChainCacheMaxEntries {
 		t.Fatalf("entries = %d, want <= %d", entries, CodexResponsesChainCacheMaxEntries)
 	}
+	_ = first
 }
 
 func TestCodexResponsesChainConcurrentRecordAndRepair(t *testing.T) {

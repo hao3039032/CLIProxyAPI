@@ -79,7 +79,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts, auth))
-	doc = ojson.NewDoc(helps.RepairCodexResponsesChainInput(doc.Bytes()))
+	body, chainParentRespID := helps.RepairCodexResponsesChainInputWithParent(doc.Bytes())
+	doc = ojson.NewDoc(body)
 	_ = doc.Delete("previous_response_id")
 	_ = doc.Delete("generate")
 	_ = doc.Delete("prompt_cache_retention")
@@ -336,7 +337,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					if eventType == "response.completed" || eventType == "response.done" {
 						cacheCodexReasoningReplayFromCompleted(replayScope, data)
-						helps.RecordCodexResponsesChainSnapshot(upstreamBody, data)
+						helps.RecordCodexResponsesChainSnapshot(upstreamBody, data, chainParentRespID)
 					}
 					translatedLine = append([]byte("data: "), data...)
 				}
@@ -524,7 +525,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					if eventType == "response.completed" || eventType == "response.done" {
 						cacheCodexReasoningReplayFromCompleted(replayScope, data)
-						helps.RecordCodexResponsesChainSnapshot(upstreamBody, data)
+						helps.RecordCodexResponsesChainSnapshot(upstreamBody, data, chainParentRespID)
 					}
 					translatedLine = append([]byte("data: "), data...)
 				}

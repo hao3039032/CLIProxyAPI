@@ -158,6 +158,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts, auth))
 	helps.SetStringIfDifferentDoc(doc, "model", baseModel)
 	helps.SetBoolIfDifferentDoc(doc, "stream", true)
+	doc = ojson.NewDoc(helps.RepairCodexResponsesChainInput(doc.Bytes()))
 	_ = doc.Delete("previous_response_id")
 	_ = doc.Delete("generate")
 	_ = doc.Delete("prompt_cache_retention")
@@ -323,6 +324,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 		if eventType == "response.completed" {
 			cacheCodexReasoningReplayFromCompleted(replayScope, completedData)
+			helps.RecordCodexResponsesChainSnapshot(upstreamBody, completedData)
 		}
 
 		var param any

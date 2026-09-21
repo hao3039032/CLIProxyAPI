@@ -66,3 +66,6 @@ docker-compose.override.yml
 
 # Local LLM Wiki vault
 .llm-wiki
+
+# Codex responses chain snapshot cache (runtime artifact)
+responses-chain-cache/

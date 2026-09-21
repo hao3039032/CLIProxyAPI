@@ -41,6 +41,7 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	}
 
 	helps.SetStringIfDifferentDoc(doc, "model", baseModel)
+	doc = ojson.NewDoc(helps.RepairCodexResponsesChainInput(doc.Bytes()))
 	_ = doc.Delete("previous_response_id")
 	helps.StripCodexSessionInstructionMarker(doc, from)
 	_ = doc.Delete("generate")

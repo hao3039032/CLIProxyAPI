@@ -2,6 +2,7 @@ package helps
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -199,6 +200,62 @@ func TestCodexResponsesChainLayeredTTLMemoryThenDiskThenExpiry(t *testing.T) {
 	advance(2 * time.Minute)
 	if updated := RepairCodexResponsesChainInput(incremental); !bytes.Equal(updated, incremental) {
 		t.Fatalf("expected miss after disk TTL expiry, got %s", updated)
+	}
+}
+
+func TestRepairCodexResponsesChainResultReportsMissingSnapshot(t *testing.T) {
+	resetCodexResponsesChainForTest(t)
+
+	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_gone","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
+	updated, parent, missing := RepairCodexResponsesChainInputWithResult(body)
+	if missing != "resp_gone" {
+		t.Fatalf("missing = %q, want resp_gone", missing)
+	}
+	if parent != "" {
+		t.Fatalf("parent = %q, want empty on miss", parent)
+	}
+	if !bytes.Equal(updated, body) {
+		t.Fatalf("body changed on miss: %s", updated)
+	}
+
+	// A hit reports the consumed parent instead.
+	RecordCodexResponsesChainSnapshot([]byte(codexResponsesChainUpstreamBody), []byte(codexResponsesChainCompleted))
+	hitBody := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_1","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
+	updated, parent, missing = RepairCodexResponsesChainInputWithResult(hitBody)
+	if missing != "" {
+		t.Fatalf("missing = %q, want empty on hit", missing)
+	}
+	if parent != "resp_1" {
+		t.Fatalf("parent = %q, want resp_1", parent)
+	}
+	if bytes.Equal(updated, hitBody) {
+		t.Fatalf("expected rebuild on hit")
+	}
+}
+
+func TestCodexResponsesChainReadsLegacyGzipFiles(t *testing.T) {
+	dir := resetCodexResponsesChainForTest(t)
+	// Hand-write a legacy gzip file instead of recording, simulating a
+	// snapshot written before the zstd switch.
+	record := codexResponsesChainDiskRecord{
+		Input:      codexResponsesChainItemsFromResult(gjson.ParseBytes([]byte(codexResponsesChainUpstreamBody)).Get("input")),
+		Output:     [][]byte{[]byte(`{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"{}"}`)},
+		RecordedAt: time.Now().Unix(),
+	}
+	payload, errMarshal := json.Marshal(record)
+	if errMarshal != nil {
+		t.Fatalf("marshal: %v", errMarshal)
+	}
+	legacyPath := filepath.Join(dir, "resp_1"+codexResponsesChainDiskLegacyExt)
+	if errWrite := os.WriteFile(legacyPath, codexResponsesChainGzipCompress(payload), 0o600); errWrite != nil {
+		t.Fatalf("write legacy file: %v", errWrite)
+	}
+
+	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_1","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
+	updated := RepairCodexResponsesChainInput(body)
+	items := gjson.GetBytes(updated, "input").Array()
+	if len(items) != 3 {
+		t.Fatalf("input items = %d, want 3 from legacy gzip snapshot: %s", len(items), updated)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -799,11 +800,28 @@ func TestCodexExecutor_BootstrapBuffering_CancelDuringBootstrapIsNotAnUpstreamFa
 	defer server.Close()
 	defer close(released)
 
+	// Cancel from the bootstrap clock rather than after a wall-clock delay. Its first call stamps the
+	// bootstrap start, after the response headers are in; the second is the budget check of the
+	// response.created frame read from upstream, which is held before the next read. Cancelling there
+	// lands mid-bootstrap with a frame buffered, and never before the client has the headers, where
+	// the transport would return a wrapped error instead.
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(150 * time.Millisecond)
+	defer cancel()
+	var bootstrapNowCalls atomic.Int32
+	t0 := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	t.Cleanup(setCodexBootstrapNowForTest(func() time.Time {
+		if bootstrapNowCalls.Add(1) == 2 {
+			cancel()
+		}
+		return t0
+	}))
+	// Bounded fallback: if the clock is consulted fewer than twice, fail and cancel instead of hanging
+	// until the package test timeout.
+	watchdog := time.AfterFunc(10*time.Second, func() {
+		t.Error("bootstrap clock was not consulted twice; cancel never fired")
 		cancel()
-	}()
+	})
+	defer watchdog.Stop()
 
 	req, opts := codexTestRequest()
 	result, err := NewCodexExecutor(codexBufferingConfig(true)).ExecuteStream(ctx, codexTestAuth(server.URL), req, opts)

@@ -82,6 +82,16 @@ var codexResponsesChainNow = time.Now
 // codexResponsesChainDir is injectable for tests.
 var codexResponsesChainDir = codexResponsesChainCacheDir
 
+// SetCodexResponsesChainDirForTest redirects the on-disk snapshot store to dir
+// and returns a func restoring the previous directory. It is for tests only
+// (e.g. a package TestMain keeping snapshots out of the source tree) and is
+// not safe for concurrent use with the chain cache or other callers.
+func SetCodexResponsesChainDirForTest(dir string) (restore func()) {
+	original := codexResponsesChainDir
+	codexResponsesChainDir = dir
+	return func() { codexResponsesChainDir = original }
+}
+
 var codexResponsesChainLastSweep time.Time
 
 var (
@@ -275,10 +285,12 @@ func RepairCodexResponsesChainInputWithResult(body []byte) (updated []byte, pare
 	return updated, respID, ""
 }
 
-// NewCodexResponsesChainMissingStatusErr builds the client-facing error for
-// ErrCodexResponsesChainSnapshotMissing: an actionable 400 whose code and
-// param let chaining clients (e.g. LangChain agents) detect the stale id and
-// retry with the full conversation history.
+// NewCodexResponsesChainMissingStatusErr builds the client-facing error for a
+// previous_response_id whose snapshot is in neither the memory nor the disk
+// tier (the missingRespID reported by RepairCodexResponsesChainInputWithResult):
+// an actionable 400 with error.code=previous_response_not_found and
+// error.param=previous_response_id, letting chaining clients (e.g. LangChain
+// agents) detect the stale id and retry with the full conversation history.
 func NewCodexResponsesChainMissingStatusErr(missingRespID string) (int, []byte) {
 	body, errBuild := sjson.SetBytes([]byte(`{"error":{}}`), "error.code", "previous_response_not_found")
 	if errBuild == nil {

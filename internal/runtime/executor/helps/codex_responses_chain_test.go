@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tidwall/gjson"
+	"github.com/MoeForge/moego/ojson"
 )
 
 func resetCodexResponsesChainForTest(t *testing.T) string {
@@ -57,7 +57,7 @@ func TestRepairCodexResponsesChainInputRebuildsIncrementalRequest(t *testing.T) 
 	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_1","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
 	updated := RepairCodexResponsesChainInput(body)
 
-	items := gjson.GetBytes(updated, "input").Array()
+	items := ojson.GetBytes(updated, "input").Array()
 	if len(items) != 3 {
 		t.Fatalf("input items = %d, want 3: %s", len(items), updated)
 	}
@@ -74,7 +74,7 @@ func TestRepairCodexResponsesChainInputRebuildsIncrementalRequest(t *testing.T) 
 		t.Fatalf("items[2].type = %q, want function_call_output", got)
 	}
 	// The field itself stays for the caller to remove.
-	if got := gjson.GetBytes(updated, "previous_response_id").String(); got != "resp_1" {
+	if got := ojson.GetBytes(updated, "previous_response_id").String(); got != "resp_1" {
 		t.Fatalf("previous_response_id = %q, want resp_1", got)
 	}
 }
@@ -87,7 +87,7 @@ func TestRepairCodexResponsesChainInputRebuildsNewUserMessage(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_2","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"thanks"}]}]}`)
 	updated := RepairCodexResponsesChainInput(body)
 
-	items := gjson.GetBytes(updated, "input").Array()
+	items := ojson.GetBytes(updated, "input").Array()
 	if len(items) != 3 {
 		t.Fatalf("input items = %d, want 3: %s", len(items), updated)
 	}
@@ -156,7 +156,7 @@ func TestRepairCodexResponsesChainInputRebuildsWithEchoedReasoningAndDedupes(t *
 	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_reason","input":[{"type":"reasoning","id":"rs_1","encrypted_content":"enc"},{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
 	updated := RepairCodexResponsesChainInput(body)
 
-	items := gjson.GetBytes(updated, "input").Array()
+	items := ojson.GetBytes(updated, "input").Array()
 	if len(items) != 4 {
 		t.Fatalf("input items = %d, want 4 (user, reasoning, function_call, function_call_output): %s", len(items), updated)
 	}
@@ -238,7 +238,7 @@ func TestCodexResponsesChainReadsLegacyGzipFiles(t *testing.T) {
 	// Hand-write a legacy gzip file instead of recording, simulating a
 	// snapshot written before the zstd switch.
 	record := codexResponsesChainDiskRecord{
-		Input:      codexResponsesChainItemsFromResult(gjson.ParseBytes([]byte(codexResponsesChainUpstreamBody)).Get("input")),
+		Input:      codexResponsesChainItemsFromResult(ojson.ParseBytes([]byte(codexResponsesChainUpstreamBody)).Get("input")),
 		Output:     [][]byte{[]byte(`{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"{}"}`)},
 		RecordedAt: time.Now().Unix(),
 	}
@@ -253,7 +253,7 @@ func TestCodexResponsesChainReadsLegacyGzipFiles(t *testing.T) {
 
 	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_1","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
 	updated := RepairCodexResponsesChainInput(body)
-	items := gjson.GetBytes(updated, "input").Array()
+	items := ojson.GetBytes(updated, "input").Array()
 	if len(items) != 3 {
 		t.Fatalf("input items = %d, want 3 from legacy gzip snapshot: %s", len(items), updated)
 	}
@@ -268,7 +268,7 @@ func TestCodexResponsesChainSurvivesMemoryResetViaDisk(t *testing.T) {
 
 	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_1","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
 	updated := RepairCodexResponsesChainInput(body)
-	items := gjson.GetBytes(updated, "input").Array()
+	items := ojson.GetBytes(updated, "input").Array()
 	if len(items) != 3 {
 		t.Fatalf("input items = %d, want 3 after disk recovery: %s", len(items), updated)
 	}
@@ -334,7 +334,7 @@ func TestCodexResponsesChainDiskFileIsCompressed(t *testing.T) {
 	wipeCodexResponsesChainMemoryForTest()
 	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_big","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"again"}]}]}`)
 	updated := RepairCodexResponsesChainInput(body)
-	items := gjson.GetBytes(updated, "input").Array()
+	items := ojson.GetBytes(updated, "input").Array()
 	if len(items) != 3 {
 		t.Fatalf("input items = %d, want 3 (cached user, cached output, new user) after compressed disk recovery", len(items))
 	}

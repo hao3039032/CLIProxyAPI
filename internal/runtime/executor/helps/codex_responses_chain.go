@@ -11,12 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/klauspost/compress/zstd"
-	log "github.com/sirupsen/logrus"
-
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -243,8 +241,8 @@ func RepairCodexResponsesChainInputWithResult(body []byte) (updated []byte, pare
 	if len(body) == 0 {
 		return body, "", ""
 	}
-	previous := gjson.GetBytes(body, "previous_response_id")
-	if previous.Type != gjson.String {
+	previous := ojson.GetBytes(body, "previous_response_id")
+	if previous.Type != ojson.String {
 		return body, "", ""
 	}
 	respID := strings.TrimSpace(previous.String())
@@ -277,7 +275,7 @@ func RepairCodexResponsesChainInputWithResult(body []byte) (updated []byte, pare
 	// across store:false turns) re-send items already present in the cached
 	// transcript; keep only the first occurrence of each id.
 	rebuilt = dedupeCodexResponsesChainItemsByID(rebuilt)
-	updated, errSet := sjson.SetRawBytes(body, "input", codexResponsesChainJoinItems(rebuilt))
+	updated, errSet := ojson.SetRawBytes(body, "input", codexResponsesChainJoinItems(rebuilt))
 	if errSet != nil {
 		return body, "", ""
 	}
@@ -292,11 +290,11 @@ func RepairCodexResponsesChainInputWithResult(body []byte) (updated []byte, pare
 // error.param=previous_response_id, letting chaining clients (e.g. LangChain
 // agents) detect the stale id and retry with the full conversation history.
 func NewCodexResponsesChainMissingStatusErr(missingRespID string) (int, []byte) {
-	body, errBuild := sjson.SetBytes([]byte(`{"error":{}}`), "error.code", "previous_response_not_found")
+	body, errBuild := ojson.SetBytes([]byte(`{"error":{}}`), "error.code", "previous_response_not_found")
 	if errBuild == nil {
-		body, _ = sjson.SetBytes(body, "error.type", "invalid_request_error")
-		body, _ = sjson.SetBytes(body, "error.param", "previous_response_id")
-		body, _ = sjson.SetBytes(body, "error.message", "No cached response found for previous_response_id '"+missingRespID+"'. This proxy forwards statelessly; after cache expiry or a restart the stored continuation is gone. Resend the full conversation input without previous_response_id to continue.")
+		body, _ = ojson.SetBytes(body, "error.type", "invalid_request_error")
+		body, _ = ojson.SetBytes(body, "error.param", "previous_response_id")
+		body, _ = ojson.SetBytes(body, "error.message", "No cached response found for previous_response_id '"+missingRespID+"'. This proxy forwards statelessly; after cache expiry or a restart the stored continuation is gone. Resend the full conversation input without previous_response_id to continue.")
 	}
 	return 400, body
 }
@@ -378,7 +376,7 @@ func promoteCodexResponsesChainEntry(respID string, inputItems, outputItems [][]
 	}
 }
 
-func codexResponsesChainItemsFromResult(result gjson.Result) [][]byte {
+func codexResponsesChainItemsFromResult(result ojson.Result) [][]byte {
 	items := result.Array()
 	out := make([][]byte, 0, len(items))
 	for _, item := range items {
@@ -614,7 +612,7 @@ func dedupeCodexResponsesChainItemsByID(items [][]byte) [][]byte {
 	seen := make(map[string]struct{})
 	deduped := make([][]byte, 0, len(items))
 	for _, item := range items {
-		itemID := strings.TrimSpace(gjson.GetBytes(item, "id").String())
+		itemID := strings.TrimSpace(ojson.GetBytes(item, "id").String())
 		if itemID != "" {
 			if _, ok := seen[itemID]; ok {
 				continue
@@ -633,16 +631,16 @@ func dedupeCodexResponsesChainItemsByID(items [][]byte) [][]byte {
 // Reasoning items are excluded: clients echo them back alongside incremental
 // input to preserve reasoning across store:false turns, and that alone must
 // not be mistaken for a full replay.
-func codexResponsesChainInputAlreadyReplayed(outputItems [][]byte, items []gjson.Result) bool {
+func codexResponsesChainInputAlreadyReplayed(outputItems [][]byte, items []ojson.Result) bool {
 	if len(outputItems) == 0 {
 		return false
 	}
 	cachedCallIDs := make(map[string]struct{})
 	cachedItemIDs := make(map[string]struct{})
 	for _, raw := range outputItems {
-		itemType := strings.TrimSpace(gjson.GetBytes(raw, "type").String())
+		itemType := strings.TrimSpace(ojson.GetBytes(raw, "type").String())
 		if itemType == "function_call" || itemType == "custom_tool_call" {
-			if callID := strings.TrimSpace(gjson.GetBytes(raw, "call_id").String()); callID != "" {
+			if callID := strings.TrimSpace(ojson.GetBytes(raw, "call_id").String()); callID != "" {
 				cachedCallIDs[callID] = struct{}{}
 			}
 			continue
@@ -650,7 +648,7 @@ func codexResponsesChainInputAlreadyReplayed(outputItems [][]byte, items []gjson
 		if itemType == "reasoning" {
 			continue
 		}
-		if itemID := strings.TrimSpace(gjson.GetBytes(raw, "id").String()); itemID != "" {
+		if itemID := strings.TrimSpace(ojson.GetBytes(raw, "id").String()); itemID != "" {
 			cachedItemIDs[itemID] = struct{}{}
 		}
 	}

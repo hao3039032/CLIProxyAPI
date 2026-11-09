@@ -8,12 +8,12 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/tidwall/gjson"
 )
 
 // codexChainTurn1Completed finishes a turn whose only output is a function call,
@@ -91,13 +91,13 @@ func assertCodexChainRebuiltSecondRequest(t *testing.T, requests *[][]byte) {
 		t.Fatalf("upstream requests = %d, want 2", count)
 	}
 	second := (*requests)[1]
-	if gjson.GetBytes(second, "previous_response_id").Exists() {
+	if ojson.GetBytes(second, "previous_response_id").Exists() {
 		t.Fatalf("previous_response_id forwarded upstream: %s", second)
 	}
-	if got := gjson.GetBytes(second, "store"); got.Type != gjson.False {
+	if got := ojson.GetBytes(second, "store"); got.Type != ojson.False {
 		t.Fatalf("store = %v, want false", got.Raw)
 	}
-	items := gjson.GetBytes(second, "input").Array()
+	items := ojson.GetBytes(second, "input").Array()
 	if len(items) != 3 {
 		t.Fatalf("input items = %d, want 3 (user, function_call, function_call_output): %s", len(items), second)
 	}
@@ -115,6 +115,67 @@ func assertCodexChainRebuiltSecondRequest(t *testing.T, requests *[][]byte) {
 	}
 	if got := items[2].Get("type").String(); got != "function_call_output" {
 		t.Fatalf("items[2].type = %q, want function_call_output", got)
+	}
+}
+
+func TestCodexExecutorChainPayloadBarrier(t *testing.T) {
+	for _, mode := range []string{"execute", "stream", "count"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := &config.Config{}
+			executor, auth, requests := newCodexChainScriptedFixture(t, nil, cfg)
+			ctx := context.Background()
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}
+			if _, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+				Model: "gpt-5.4", Payload: []byte(codexChainTurn1Request),
+			}, opts); err != nil {
+				t.Fatal(err)
+			}
+
+			// Rules must see the rebuilt history, and deleting an array item must run only once.
+			models := []config.PayloadModelRule{{Name: "gpt-5.4"}}
+			cfg.Payload = config.PayloadConfig{
+				Override: []config.PayloadRule{{Models: models, Params: map[string]any{"input.2.output": "configured result"}}},
+				Filter:   []config.PayloadFilterRule{{Models: models, Params: []string{"input.0"}}},
+			}
+			req := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(codexChainTurn2Request)}
+			switch mode {
+			case "execute":
+				if _, err := executor.Execute(ctx, auth, req, opts); err != nil {
+					t.Fatal(err)
+				}
+			case "stream":
+				result, err := executor.ExecuteStream(ctx, auth, req, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						t.Fatal(chunk.Err)
+					}
+				}
+			case "count":
+				result, err := executor.CountTokens(ctx, auth, req, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				controlReq := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(`{"model":"gpt-5.4","input":[{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"configured result"}]}`)}
+				control, errControl := NewCodexExecutor(&config.Config{}).CountTokens(ctx, auth, controlReq, opts)
+				if errControl != nil {
+					t.Fatal(errControl)
+				}
+				if got, want := ojson.GetBytes(result.Payload, "response.usage.input_tokens").Int(), ojson.GetBytes(control.Payload, "response.usage.input_tokens").Int(); got != want {
+					t.Fatalf("configured chain tokens = %d, want %d", got, want)
+				}
+				return
+			}
+			if len(*requests) != 2 {
+				t.Fatalf("upstream requests = %d, want 2", len(*requests))
+			}
+			body := (*requests)[1]
+			if ojson.GetBytes(body, "input.#").Int() != 2 || ojson.GetBytes(body, "input.0.type").String() != "function_call" || ojson.GetBytes(body, "input.1.output").String() != "configured result" {
+				t.Fatalf("payload rules did not apply exactly once after chain reconstruction: %s", body)
+			}
+		})
 	}
 }
 
@@ -180,10 +241,10 @@ func TestCodexExecutorExecuteChainCacheMissReturnsPreviousResponseNotFound(t *te
 		t.Fatalf("status = %d, want 400", code)
 	}
 	body := err.Error()
-	if got := gjson.Get(body, "error.code").String(); got != "previous_response_not_found" {
+	if got := ojson.Get(body, "error.code").String(); got != "previous_response_not_found" {
 		t.Fatalf("error.code = %q, want previous_response_not_found (body: %s)", got, body)
 	}
-	if got := gjson.Get(body, "error.param").String(); got != "previous_response_id" {
+	if got := ojson.Get(body, "error.param").String(); got != "previous_response_id" {
 		t.Fatalf("error.param = %q, want previous_response_id", got)
 	}
 	// The broken request must not be forwarded upstream.
@@ -209,7 +270,7 @@ func TestCodexExecutorExecuteStreamChainCacheMissReturnsPreviousResponseNotFound
 	if code := statusErr.StatusCode(); code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", code)
 	}
-	if got := gjson.Get(err.Error(), "error.code").String(); got != "previous_response_not_found" {
+	if got := ojson.Get(err.Error(), "error.code").String(); got != "previous_response_not_found" {
 		t.Fatalf("error.code = %q, want previous_response_not_found", got)
 	}
 	if requests != nil && len(*requests) != 0 {
@@ -248,10 +309,10 @@ func TestCodexExecutorExecuteChainAccumulatesAcrossMultipleHops(t *testing.T) {
 		t.Fatalf("upstream requests = %d, want 3", len(*requests))
 	}
 	third := (*requests)[2]
-	if gjson.GetBytes(third, "previous_response_id").Exists() {
+	if ojson.GetBytes(third, "previous_response_id").Exists() {
 		t.Fatalf("previous_response_id forwarded upstream: %s", third)
 	}
-	items := gjson.GetBytes(third, "input").Array()
+	items := ojson.GetBytes(third, "input").Array()
 	if len(items) != 5 {
 		t.Fatalf("input items = %d, want 5 accumulated items: %s", len(items), third)
 	}
@@ -313,10 +374,10 @@ func TestCodexExecutorExecuteStreamRecordsResponseDoneEvent(t *testing.T) {
 		t.Fatalf("upstream requests = %d, want 2", len(*requests))
 	}
 	second := (*requests)[1]
-	if gjson.GetBytes(second, "previous_response_id").Exists() {
+	if ojson.GetBytes(second, "previous_response_id").Exists() {
 		t.Fatalf("previous_response_id forwarded upstream: %s", second)
 	}
-	items := gjson.GetBytes(second, "input").Array()
+	items := ojson.GetBytes(second, "input").Array()
 	if len(items) != 3 {
 		t.Fatalf("input items = %d, want 3 after recording response.done: %s", len(items), second)
 	}
@@ -349,7 +410,7 @@ func TestCodexExecutorExecuteDoesNotRecordIncompleteResponse(t *testing.T) {
 	if code := statusErr.StatusCode(); code != http.StatusBadRequest {
 		t.Fatalf("turn 2 status = %d, want 400", code)
 	}
-	if got := gjson.Get(err.Error(), "error.code").String(); got != "previous_response_not_found" {
+	if got := ojson.Get(err.Error(), "error.code").String(); got != "previous_response_not_found" {
 		t.Fatalf("turn 2 error.code = %q, want previous_response_not_found", got)
 	}
 	// The incomplete response never anchored a chain snapshot, so the second
@@ -405,8 +466,8 @@ func TestCodexExecutorCountTokensUsesRebuiltChainInput(t *testing.T) {
 		t.Fatalf("CountTokens (no cache) error: %v", err)
 	}
 
-	rebuilt := gjson.GetBytes(countRebuilt.Payload, "response.usage.input_tokens").Int()
-	incrementalOnly := gjson.GetBytes(countIncrementalOnly.Payload, "response.usage.input_tokens").Int()
+	rebuilt := ojson.GetBytes(countRebuilt.Payload, "response.usage.input_tokens").Int()
+	incrementalOnly := ojson.GetBytes(countIncrementalOnly.Payload, "response.usage.input_tokens").Int()
 	if rebuilt <= incrementalOnly {
 		t.Fatalf("rebuilt token count = %d, want greater than incremental-only %d", rebuilt, incrementalOnly)
 	}
@@ -420,7 +481,7 @@ func TestCodexExecutorCountTokensUsesRebuiltChainInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CountTokens (control) error: %v", err)
 	}
-	control := gjson.GetBytes(countControl.Payload, "response.usage.input_tokens").Int()
+	control := ojson.GetBytes(countControl.Payload, "response.usage.input_tokens").Int()
 	if rebuilt != control {
 		t.Fatalf("rebuilt token count = %d, want exactly the full-history control count %d", rebuilt, control)
 	}

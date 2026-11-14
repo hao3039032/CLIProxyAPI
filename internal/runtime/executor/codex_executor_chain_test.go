@@ -2,6 +2,8 @@ package executor
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -484,5 +486,92 @@ func TestCodexExecutorCountTokensUsesRebuiltChainInput(t *testing.T) {
 	control := ojson.GetBytes(countControl.Payload, "response.usage.input_tokens").Int()
 	if rebuilt != control {
 		t.Fatalf("rebuilt token count = %d, want exactly the full-history control count %d", rebuilt, control)
+	}
+}
+
+func TestCodexExecutorExecuteStreamNativeCodexRecordsCollectedOutput(t *testing.T) {
+	// Native Codex completions are forwarded unpatched and may carry an empty
+	// response.output; the snapshot must still hold the collected output items.
+	nativeTurn1 := `data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","status":"completed","call_id":"call_1","name":"get_weather","arguments":"{}"}}` + "\n\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":0,"status":"completed","background":false,"error":null,"output":[],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}`
+	executor, auth, requests := newCodexChainScriptedFixture(t, []string{nativeTurn1, codexChainTurn2Completed})
+	headers := http.Header{}
+	headers.Set("X-OpenAI-Internal-Codex-Responses-Lite", "true")
+
+	for _, payload := range []string{codexChainTurn1Request, codexChainTurn2Request} {
+		result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+			Model:   "gpt-5.4",
+			Payload: []byte(payload),
+		}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: true, Headers: headers})
+		if err != nil {
+			t.Fatalf("ExecuteStream error: %v", err)
+		}
+		for range result.Chunks {
+		}
+	}
+
+	assertCodexChainRebuiltSecondRequest(t, requests)
+}
+
+func TestCodexExecutorChainCacheMissOnDownstreamWebsocketRequiresFullContext(t *testing.T) {
+	executor, auth, requests := newCodexChainFixture(t)
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	req := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(codexChainTurn2Request)}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}
+
+	_, errExec := executor.Execute(ctx, auth, req, opts)
+	_, errStream := executor.ExecuteStream(ctx, auth, req, opts)
+	for label, err := range map[string]error{"execute": errExec, "stream": errStream} {
+		var turnErr *cliproxyexecutor.UpstreamWebsocketTurnError
+		if !errors.As(err, &turnErr) || !turnErr.FullContextRequired {
+			t.Fatalf("%s error = %T %v, want full-context websocket turn error", label, err, err)
+		}
+	}
+	if len(*requests) != 0 {
+		t.Fatalf("upstream requests = %d, want 0", len(*requests))
+	}
+}
+
+func TestCodexExecutorCompatCompactionRebuildsPreviousResponseChain(t *testing.T) {
+	summaryCompleted := `data: {"type":"response.completed","response":{"id":"resp_sum","object":"response","created_at":0,"status":"completed","background":false,"error":null,"output":[{"type":"message","id":"msg_sum","status":"completed","role":"assistant","content":[{"type":"output_text","text":"summary"}]}],"usage":{"input_tokens":20,"output_tokens":8,"total_tokens":28}}}`
+	cfg := &config.Config{}
+	executor, auth, requests := newCodexChainScriptedFixture(t, []string{codexChainTurn1Completed, summaryCompleted}, cfg)
+	cfg.CodexKey = []config.CodexKey{{
+		APIKey:  auth.Attributes["api_key"],
+		BaseURL: auth.Attributes["base_url"],
+		Models:  []config.CodexModel{{Name: "gpt-5.4", IsCompat: true}},
+	}}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, ResponseFormat: sdktranslator.FormatOpenAIResponse}
+
+	if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(codexChainTurn1Request)}, opts); err != nil {
+		t.Fatalf("turn 1 Execute error: %v", err)
+	}
+	trigger := `{"model":"gpt-5.4","previous_response_id":"resp_1","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"},{"type":"compaction_trigger"}]}`
+	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(trigger)}, opts)
+	if err != nil {
+		t.Fatalf("compaction Execute error: %v", err)
+	}
+	if got := ojson.GetBytes(resp.Payload, "object").String(); got != "response.compaction" {
+		t.Fatalf("compaction object = %q, want response.compaction: %s", got, resp.Payload)
+	}
+	if len(*requests) != 2 {
+		t.Fatalf("upstream requests = %d, want 2", len(*requests))
+	}
+	summary := (*requests)[1]
+	if ojson.GetBytes(summary, "previous_response_id").Exists() {
+		t.Fatalf("previous_response_id forwarded upstream: %s", summary)
+	}
+	items := ojson.GetBytes(summary, "input").Array()
+	if len(items) < 4 || items[0].Get("content.0.text").String() != "weather in SF?" || items[1].Get("call_id").String() != "call_1" || items[2].Get("type").String() != "function_call_output" {
+		t.Fatalf("summary input did not replay the cached chain: %s", summary)
+	}
+
+	// The summary turn's upstream id is never exposed to the client, so it must not be recorded.
+	_, errChained := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","previous_response_id":"resp_sum","input":[{"type":"message","role":"user","content":"next"}]}`),
+	}, opts)
+	if got := ojson.Get(fmt.Sprint(errChained), "error.code").String(); got != "previous_response_not_found" {
+		t.Fatalf("chaining from the summary upstream id error = %v, want previous_response_not_found", errChained)
 	}
 }

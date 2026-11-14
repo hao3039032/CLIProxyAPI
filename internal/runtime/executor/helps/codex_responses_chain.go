@@ -3,14 +3,16 @@ package helps
 import (
 	"bytes"
 	"compress/gzip"
-	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/base64"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/klauspost/compress/zstd"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
@@ -119,10 +121,14 @@ var (
 	codexResponsesChainTotalBytes int
 )
 
+// codexResponsesChainDiskRecord is the decoded on-disk snapshot. Files store
+// {"input":[...],"output":[...],"recorded_at":N} with the items embedded as
+// raw JSON; files written by earlier builds hold base64 strings per item and
+// are still decoded.
 type codexResponsesChainDiskRecord struct {
-	Input      [][]byte `json:"input"`
-	Output     [][]byte `json:"output"`
-	RecordedAt int64    `json:"recorded_at"`
+	Input      [][]byte
+	Output     [][]byte
+	RecordedAt int64
 }
 
 // RecordCodexResponsesChainSnapshot stores the conversation snapshot of a
@@ -222,17 +228,10 @@ func RepairCodexResponsesChainInput(body []byte) []byte {
 	return updated
 }
 
-// RepairCodexResponsesChainInputWithParent behaves like
+// RepairCodexResponsesChainInputWithResult behaves like
 // RepairCodexResponsesChainInput and additionally returns the resp id whose
-// snapshot was consumed to rebuild the input, so the caller can fold it away
-// once this turn's response completes.
-func RepairCodexResponsesChainInputWithParent(body []byte) ([]byte, string) {
-	updated, parent, _ := RepairCodexResponsesChainInputWithResult(body)
-	return updated, parent
-}
-
-// RepairCodexResponsesChainInputWithResult additionally returns the resp id
-// of a missing snapshot: the request relies on previous_response_id chaining
+// snapshot was consumed to rebuild the input (so the caller can fold it away
+// once this turn's response completes) and the resp id of a missing snapshot: the request relies on previous_response_id chaining
 // but neither cache tier holds that id. The Codex upstream is stateless, so
 // forwarding such a request can only fail with an orphaned-tool-call
 // rejection; callers that can surface an error to the client should return a
@@ -432,11 +431,7 @@ func writeCodexResponsesChainDisk(respID string, inputItems, outputItems [][]byt
 	if errMkdir := os.MkdirAll(codexResponsesChainDir, 0o700); errMkdir != nil {
 		return
 	}
-	record := codexResponsesChainDiskRecord{Input: inputItems, Output: outputItems, RecordedAt: now.Unix()}
-	payload, errMarshal := json.Marshal(record)
-	if errMarshal != nil {
-		return
-	}
+	payload := encodeCodexResponsesChainDiskRecord(inputItems, outputItems, now.Unix())
 	var compressed []byte
 	if codexResponsesChainZstdEncoder != nil {
 		compressed = codexResponsesChainZstdEncoder.EncodeAll(payload, nil)
@@ -512,8 +507,8 @@ func readCodexResponsesChainDisk(respID string, now time.Time) (codexResponsesCh
 		remove()
 		return codexResponsesChainDiskRecord{}, false
 	}
-	var record codexResponsesChainDiskRecord
-	if errUnmarshal := json.Unmarshal(payload, &record); errUnmarshal != nil {
+	record, okDecode := decodeCodexResponsesChainDiskRecord(payload)
+	if !okDecode {
 		remove()
 		return codexResponsesChainDiskRecord{}, false
 	}
@@ -526,6 +521,64 @@ func readCodexResponsesChainDisk(respID string, now time.Time) (codexResponsesCh
 		return codexResponsesChainDiskRecord{}, false
 	}
 	return record, true
+}
+
+// encodeCodexResponsesChainDiskRecord embeds the items as raw JSON; they are
+// already valid JSON values, and avoiding a per-item base64 layer keeps both
+// the encode cost and the compressed size down.
+func encodeCodexResponsesChainDiskRecord(inputItems, outputItems [][]byte, recordedAt int64) []byte {
+	var buf bytes.Buffer
+	buf.WriteString(`{"input":`)
+	buf.Write(codexResponsesChainJoinItems(inputItems))
+	buf.WriteString(`,"output":`)
+	buf.Write(codexResponsesChainJoinItems(outputItems))
+	buf.WriteString(`,"recorded_at":`)
+	buf.WriteString(strconv.FormatInt(recordedAt, 10))
+	buf.WriteByte('}')
+	return buf.Bytes()
+}
+
+func decodeCodexResponsesChainDiskRecord(payload []byte) (codexResponsesChainDiskRecord, bool) {
+	if !ojson.ValidBytes(payload) {
+		return codexResponsesChainDiskRecord{}, false
+	}
+	input, okInput := decodeCodexResponsesChainDiskItems(ojson.GetBytesNoCopy(payload, "input"))
+	output, okOutput := decodeCodexResponsesChainDiskItems(ojson.GetBytesNoCopy(payload, "output"))
+	if !okInput || !okOutput {
+		return codexResponsesChainDiskRecord{}, false
+	}
+	return codexResponsesChainDiskRecord{
+		Input:      input,
+		Output:     output,
+		RecordedAt: ojson.GetBytesNoCopy(payload, "recorded_at").Int(),
+	}, true
+}
+
+func decodeCodexResponsesChainDiskItems(result ojson.Result) ([][]byte, bool) {
+	if !result.Exists() || result.Type == ojson.Null {
+		return nil, true
+	}
+	if !result.IsArray() {
+		return nil, false
+	}
+	items := result.Array()
+	out := make([][]byte, 0, len(items))
+	for _, item := range items {
+		if item.Type == ojson.String {
+			// Legacy record: encoding/json stored each []byte item as base64.
+			decoded, errDecode := base64.StdEncoding.DecodeString(item.String())
+			if errDecode != nil || !ojson.ValidBytes(decoded) {
+				return nil, false
+			}
+			out = append(out, decoded)
+			continue
+		}
+		if len(item.Raw) == 0 {
+			continue
+		}
+		out = append(out, []byte(item.Raw))
+	}
+	return out, true
 }
 
 func deleteCodexResponsesChainDisk(respID string) {
@@ -590,13 +643,7 @@ func sweepCodexResponsesChainDisk(now time.Time) {
 		return
 	}
 	// Over budget: drop oldest files first until back under the cap.
-	for i := 0; i < len(candidates); i++ {
-		for j := i + 1; j < len(candidates); j++ {
-			if candidates[j].modTime.Before(candidates[i].modTime) {
-				candidates[i], candidates[j] = candidates[j], candidates[i]
-			}
-		}
-	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].modTime.Before(candidates[j].modTime) })
 	for _, candidate := range candidates {
 		if totalBytes <= CodexResponsesChainDiskMaxTotalBytes {
 			break

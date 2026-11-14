@@ -83,6 +83,45 @@ func validateCodexLocalCompactionSource(ctx context.Context, payload []byte) err
 	return nil
 }
 
+// codexResponsesChainMissingErr reports a previous_response_id whose snapshot is
+// in neither chain cache tier. Downstream websocket turns get the same
+// full-context turn error as other unresolvable continuations so the client
+// socket stays open; HTTP callers get an actionable previous_response_not_found.
+func codexResponsesChainMissingErr(ctx context.Context, payload []byte, missingRespID string) error {
+	if cliproxyexecutor.DownstreamWebsocket(ctx) {
+		return &cliproxyexecutor.UpstreamWebsocketTurnError{
+			FullContextRequired: true,
+			EventID:             strings.Clone(strings.TrimSpace(ojson.GetBytesNoCopy(payload, "event_id").String())),
+		}
+	}
+	code, errBody := helps.NewCodexResponsesChainMissingStatusErr(missingRespID)
+	return statusErr{code: code, msg: string(errBody)}
+}
+
+// rebuildCodexCompactionSourceChain expands a local compaction source that
+// chains through previous_response_id into the full transcript from the
+// responses chain cache, so compat compaction keeps working for incremental
+// previous_response_id clients on the stateless HTTP path. Synthetic
+// compaction ids, append requests, and non-array inputs are left for
+// validateCodexLocalCompactionSource to reject.
+func rebuildCodexCompactionSourceChain(ctx context.Context, payload []byte) ([]byte, error) {
+	prev := ojson.GetBytesNoCopy(payload, "previous_response_id")
+	prevID := strings.TrimSpace(prev.String())
+	if prev.Type != ojson.String || prevID == "" || helps.RecognizedResponsesCompactionResponseID(prevID) {
+		return payload, nil
+	}
+	if strings.TrimSpace(ojson.GetBytesNoCopy(payload, "type").String()) == "response.append" || !ojson.GetBytesNoCopy(payload, "input").IsArray() {
+		return payload, nil
+	}
+	rebuilt, _, missingRespID := helps.RepairCodexResponsesChainInputWithResult(payload)
+	if missingRespID != "" {
+		return payload, codexResponsesChainMissingErr(ctx, payload, missingRespID)
+	}
+	doc := ojson.NewDoc(rebuilt)
+	_ = doc.Delete("previous_response_id")
+	return doc.Bytes(), nil
+}
+
 func (e *CodexExecutor) expandCodexResponsesCompaction(auth *cliproxyauth.Auth, req *cliproxyexecutor.Request, opts *cliproxyexecutor.Options, baseModel string) (bool, error) {
 	if req == nil || opts == nil {
 		return false, nil
@@ -158,12 +197,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts, auth))
 	helps.SetStringIfDifferentDoc(doc, "model", baseModel)
 	helps.SetBoolIfDifferentDoc(doc, "stream", true)
-	var chainParentRespID string
-	var chainMissingRespID string
-	body, chainParentRespID, chainMissingRespID = helps.RepairCodexResponsesChainInputWithResult(doc.Bytes())
+	body, chainParentRespID, chainMissingRespID := helps.RepairCodexResponsesChainInputWithResult(doc.Bytes())
 	if chainMissingRespID != "" {
-		code, errBody := helps.NewCodexResponsesChainMissingStatusErr(chainMissingRespID)
-		err = statusErr{code: code, msg: string(errBody)}
+		err = codexResponsesChainMissingErr(ctx, req.Payload, chainMissingRespID)
 		return resp, err
 	}
 	doc = ojson.NewDoc(body)
@@ -332,7 +368,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 		if eventType == "response.completed" {
 			cacheCodexReasoningReplayFromCompleted(replayScope, completedData)
-			helps.RecordCodexResponsesChainSnapshot(upstreamBody, completedData, chainParentRespID)
+			// A compaction summary turn is answered with a synthetic response id the
+			// client chains from, so its upstream snapshot could never be referenced.
+			if !isCompactionSummary {
+				helps.RecordCodexResponsesChainSnapshot(upstreamBody, completedData, chainParentRespID)
+			}
 		}
 
 		var param any
@@ -394,7 +434,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 func (e *CodexExecutor) executeCodexResponsesCompaction(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	var resp cliproxyexecutor.Response
-	sourcePayload := helps.ResponsesCompactionSourcePayload(req, opts)
+	sourcePayload, errChain := rebuildCodexCompactionSourceChain(ctx, helps.ResponsesCompactionSourcePayload(req, opts))
+	if errChain != nil {
+		return resp, errChain
+	}
 	if errValidate := validateCodexLocalCompactionSource(ctx, sourcePayload); errValidate != nil {
 		return resp, errValidate
 	}

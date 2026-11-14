@@ -79,12 +79,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts, auth))
-	var chainParentRespID string
-	var chainMissingRespID string
-	body, chainParentRespID, chainMissingRespID = helps.RepairCodexResponsesChainInputWithResult(doc.Bytes())
+	body, chainParentRespID, chainMissingRespID := helps.RepairCodexResponsesChainInputWithResult(doc.Bytes())
 	if chainMissingRespID != "" {
-		code, errBody := helps.NewCodexResponsesChainMissingStatusErr(chainMissingRespID)
-		return nil, statusErr{code: code, msg: string(errBody)}
+		return nil, codexResponsesChainMissingErr(ctx, req.Payload, chainMissingRespID)
 	}
 	doc = ojson.NewDoc(body)
 	_ = doc.Delete("previous_response_id")
@@ -343,7 +340,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					if eventType == "response.completed" || eventType == "response.done" {
 						cacheCodexReasoningReplayFromCompleted(replayScope, data)
-						helps.RecordCodexResponsesChainSnapshot(upstreamBody, data, chainParentRespID)
+						recordCodexResponsesChainFromStream(upstreamBody, data, chainParentRespID, preserveNativeOutput, outputItemsByIndex, outputItemsFallback)
 					}
 					translatedLine = append([]byte("data: "), data...)
 				}
@@ -531,7 +528,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					if eventType == "response.completed" || eventType == "response.done" {
 						cacheCodexReasoningReplayFromCompleted(replayScope, data)
-						helps.RecordCodexResponsesChainSnapshot(upstreamBody, data, chainParentRespID)
+						recordCodexResponsesChainFromStream(upstreamBody, data, chainParentRespID, preserveNativeOutput, outputItemsByIndex, outputItemsFallback)
 					}
 					translatedLine = append([]byte("data: "), data...)
 				}
@@ -581,4 +578,16 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+// recordCodexResponsesChainFromStream records the chain snapshot of a completed
+// streamed response. Native Codex clients receive the completion unpatched, but
+// the snapshot always needs the full output collected from
+// response.output_item.done, or the next incremental turn would replay the
+// history without the assistant's tool calls.
+func recordCodexResponsesChainFromStream(upstreamBody, data []byte, parentRespID string, preserveNativeOutput bool, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) {
+	if preserveNativeOutput {
+		data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
+	}
+	helps.RecordCodexResponsesChainSnapshot(upstreamBody, data, parentRespID)
 }

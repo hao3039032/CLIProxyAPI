@@ -2,7 +2,6 @@ package helps
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/base64"
 	"github.com/MoeForge/moego/ojson"
 )
 
@@ -237,15 +237,13 @@ func TestCodexResponsesChainReadsLegacyGzipFiles(t *testing.T) {
 	dir := resetCodexResponsesChainForTest(t)
 	// Hand-write a legacy gzip file instead of recording, simulating a
 	// snapshot written before the zstd switch.
-	record := codexResponsesChainDiskRecord{
-		Input:      codexResponsesChainItemsFromResult(ojson.ParseBytes([]byte(codexResponsesChainUpstreamBody)).Get("input")),
-		Output:     [][]byte{[]byte(`{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"{}"}`)},
-		RecordedAt: time.Now().Unix(),
-	}
-	payload, errMarshal := json.Marshal(record)
-	if errMarshal != nil {
-		t.Fatalf("marshal: %v", errMarshal)
-	}
+	// Legacy records stored every item as a base64 string (encoding/json of [][]byte).
+	inputItem := ojson.GetBytes([]byte(codexResponsesChainUpstreamBody), "input.0").Raw
+	outputItem := `{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"{}"}`
+	payload := []byte(fmt.Sprintf(`{"input":[%q],"output":[%q],"recorded_at":%d}`,
+		base64.StdEncoding.EncodeToString([]byte(inputItem)),
+		base64.StdEncoding.EncodeToString([]byte(outputItem)),
+		time.Now().Unix()))
 	legacyPath := filepath.Join(dir, "resp_1"+codexResponsesChainDiskLegacyExt)
 	if errWrite := os.WriteFile(legacyPath, codexResponsesChainGzipCompress(payload), 0o600); errWrite != nil {
 		t.Fatalf("write legacy file: %v", errWrite)
@@ -340,6 +338,26 @@ func TestCodexResponsesChainDiskFileIsCompressed(t *testing.T) {
 	}
 	if len(items[0].Get("content.0.text").String()) != len(bigText) {
 		t.Fatalf("recovered user message text length mismatch")
+	}
+}
+
+func TestCodexResponsesChainDiskRecordEmbedsRawJSONItems(t *testing.T) {
+	dir := resetCodexResponsesChainForTest(t)
+	RecordCodexResponsesChainSnapshot([]byte(codexResponsesChainUpstreamBody), []byte(codexResponsesChainCompleted))
+
+	raw, errRead := os.ReadFile(filepath.Join(dir, "resp_1"+codexResponsesChainDiskExt))
+	if errRead != nil {
+		t.Fatalf("read snapshot: %v", errRead)
+	}
+	payload, ok := codexResponsesChainDecompress(raw)
+	if !ok {
+		t.Fatalf("decompress snapshot failed")
+	}
+	if got := ojson.GetBytes(payload, "input.0.type").String(); got != "message" {
+		t.Fatalf("input.0.type = %q, want raw JSON item: %s", got, payload)
+	}
+	if got := ojson.GetBytes(payload, "output.0.call_id").String(); got != "call_1" {
+		t.Fatalf("output.0.call_id = %q, want raw JSON item: %s", got, payload)
 	}
 }
 

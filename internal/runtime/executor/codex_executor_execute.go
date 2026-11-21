@@ -212,6 +212,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			err = codexResponsesChainMissingErr(ctx, req.Payload, chainMissingRespID)
 			return resp, err
 		}
+	} else {
+		// Keep the doc edits (output budget, model, thinking, stream) in body;
+		// rebuilding doc from the unedited translation below would drop them.
+		body = doc.Bytes()
 	}
 	doc = ojson.NewDoc(body)
 	_ = doc.Delete("previous_response_id")

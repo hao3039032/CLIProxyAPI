@@ -137,8 +137,9 @@ type codexResponsesChainDiskRecord struct {
 // upstreamBody is the request body the upstream accepted; completedData is the
 // native response.completed payload carrying response.id and response.output.
 // A non-empty replacesRespID (the snapshot consumed while repairing this
-// request) is folded away: once the successor is durably recorded the parent
-// chain entry will never be referenced again.
+// request) is folded away in memory; its disk file is removed only once the
+// successor is durably recorded, so a failed disk write never orphans the
+// parent's last persistent copy.
 func RecordCodexResponsesChainSnapshot(upstreamBody, completedData []byte, replacesRespID ...string) {
 	// Clone: the no-copy gjson result aliases completedData's backing buffer,
 	// and a map key must not pin the whole response body in memory.
@@ -172,7 +173,7 @@ func RecordCodexResponsesChainSnapshot(upstreamBody, completedData []byte, repla
 	}
 
 	now := codexResponsesChainNow()
-	writeCodexResponsesChainDisk(respID, inputItems, outputItems, now)
+	diskWriteOK := writeCodexResponsesChainDisk(respID, inputItems, outputItems, now)
 
 	foldedParent := ""
 	if len(replacesRespID) > 0 {
@@ -200,7 +201,12 @@ func RecordCodexResponsesChainSnapshot(upstreamBody, completedData []byte, repla
 			codexResponsesChainTotalBytes -= parent.bytes
 			delete(codexResponsesChainEntries, foldedParent)
 		}
-		deleteCodexResponsesChainDisk(foldedParent)
+		// Fold the parent's disk copy only after the successor survived on disk;
+		// otherwise the parent would lose its only durable copy and the chain
+		// would break for good once the successor leaves memory.
+		if diskWriteOK {
+			deleteCodexResponsesChainDisk(foldedParent)
+		}
 	}
 	if foldedParent != "" {
 		log.Infof("codex responses chain: recorded snapshot resp=%s inputItems=%d outputItems=%d bytes=%d folds=%s", respID, len(inputItems), len(outputItems), entryBytes, foldedParent)
@@ -424,12 +430,15 @@ func codexResponsesChainSafeFileName(respID string) bool {
 	return !strings.Contains(respID, "..")
 }
 
-func writeCodexResponsesChainDisk(respID string, inputItems, outputItems [][]byte, now time.Time) {
+// writeCodexResponsesChainDisk persists a snapshot atomically (tmp file plus
+// rename) and reports whether the record is durably on disk. Callers use the
+// result to decide whether older chain links may be folded away on disk.
+func writeCodexResponsesChainDisk(respID string, inputItems, outputItems [][]byte, now time.Time) bool {
 	if !codexResponsesChainSafeFileName(respID) {
-		return
+		return false
 	}
 	if errMkdir := os.MkdirAll(codexResponsesChainDir, 0o700); errMkdir != nil {
-		return
+		return false
 	}
 	payload := encodeCodexResponsesChainDiskRecord(inputItems, outputItems, now.Unix())
 	var compressed []byte
@@ -441,12 +450,13 @@ func writeCodexResponsesChainDisk(respID string, inputItems, outputItems [][]byt
 	path := filepath.Join(codexResponsesChainDir, respID+codexResponsesChainDiskExt)
 	tmp := path + ".tmp"
 	if errWrite := os.WriteFile(tmp, compressed, 0o600); errWrite != nil {
-		return
+		return false
 	}
 	if errRename := os.Rename(tmp, path); errRename != nil {
 		_ = os.Remove(tmp)
-		return
+		return false
 	}
+	return true
 }
 
 func codexResponsesChainGzipCompress(payload []byte) []byte {

@@ -188,7 +188,7 @@ func TestCodexResponsesChainLayeredTTLMemoryThenDiskThenExpiry(t *testing.T) {
 		t.Fatalf("expected rebuild from memory")
 	}
 
-	// Once the memory entry expires, the on-disk tier (24h TTL) still serves.
+	// Once the memory entry expires, the on-disk tier (2h TTL) still serves.
 	wipeCodexResponsesChainMemoryForTest()
 	advance(CodexResponsesChainDiskTTL - CodexResponsesChainCacheTTL)
 	if updated := RepairCodexResponsesChainInput(incremental); bytes.Equal(updated, incremental) {
@@ -309,6 +309,50 @@ func TestCodexResponsesChainFoldDeletesParentOnDiskAndMemory(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_1","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
 	if updated := RepairCodexResponsesChainInput(body); !bytes.Equal(updated, body) {
 		t.Fatalf("body changed for folded parent: %s", updated)
+	}
+}
+
+// A failed successor disk write must not delete the parent's only durable
+// copy: the fold keeps the parent snapshot on disk so the chain survives a
+// later memory eviction, while the in-memory fold still happens.
+func TestCodexResponsesChainFoldKeepsParentDiskWhenSuccessorWriteFails(t *testing.T) {
+	dir := resetCodexResponsesChainForTest(t)
+	RecordCodexResponsesChainSnapshot([]byte(codexResponsesChainUpstreamBody), []byte(codexResponsesChainCompleted))
+	parentPath := filepath.Join(dir, "resp_1"+codexResponsesChainDiskExt)
+	if _, errStat := os.Stat(parentPath); errStat != nil {
+		t.Fatalf("parent snapshot missing before fold: %v", errStat)
+	}
+
+	// Occupy the successor's tmp path with a directory so only its write fails
+	// (writing to a directory returns EISDIR) while removes still work, the
+	// shape of a transient write failure such as a full disk.
+	if errMkdir := os.Mkdir(filepath.Join(dir, "resp_2"+codexResponsesChainDiskExt+".tmp"), 0o700); errMkdir != nil {
+		t.Fatalf("mkdir blocker: %v", errMkdir)
+	}
+
+	turn2Upstream := []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"weather in SF?"}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
+	turn2Completed := `{"type":"response.completed","response":{"id":"resp_2","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Sunny."}]}]}}`
+	RecordCodexResponsesChainSnapshot(turn2Upstream, []byte(turn2Completed), "resp_1")
+
+	codexResponsesChainMu.Lock()
+	_, parentInMemory := codexResponsesChainEntries["resp_1"]
+	_, childInMemory := codexResponsesChainEntries["resp_2"]
+	codexResponsesChainMu.Unlock()
+	if parentInMemory {
+		t.Fatalf("parent memory entry should still fold away")
+	}
+	if !childInMemory {
+		t.Fatalf("child memory entry should exist")
+	}
+	if _, errStat := os.Stat(parentPath); errStat != nil {
+		t.Fatalf("parent disk file must survive a failed successor write: %v", errStat)
+	}
+
+	// After memory loss the parent snapshot is still recoverable from disk.
+	wipeCodexResponsesChainMemoryForTest()
+	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_1","input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`)
+	if updated := RepairCodexResponsesChainInput(body); bytes.Equal(updated, body) {
+		t.Fatalf("expected rebuild from the retained parent disk snapshot")
 	}
 }
 

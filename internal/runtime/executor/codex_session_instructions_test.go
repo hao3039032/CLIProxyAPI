@@ -109,6 +109,66 @@ func TestCodexSessionInstructionsHTTP(t *testing.T) {
 	}
 }
 
+// A marked request skips the responses chain rebuild, so body must be
+// refreshed from the edited doc in the else branch: the model-suffix thinking
+// effort and the Execute stream=true edit still have to reach the upstream.
+func TestCodexSessionInstructionsMarkerKeepsExecuteDocEdits(t *testing.T) {
+	server, captured, _ := newCodexHostedImageTestServer(t, "http")
+	exec := NewCodexExecutor(&config.Config{})
+	req := core.Request{Model: "gpt-5.4(high)", Payload: []byte(`{"input":"hi","instructions":" A ","client_metadata":{"cpa_session_instructions":"start"}}`)}
+	if _, errExecute := exec.Execute(t.Context(), codexOAuthTestAuth(server.URL), req, managedInstructionsOptions(t)); errExecute != nil {
+		t.Fatal(errExecute)
+	}
+	body := ojson.NewDoc((<-captured).body)
+	if got := body.Get("reasoning.effort").String(); got != "high" {
+		t.Fatalf("reasoning.effort = %q, want high from the model suffix: %s", got, body.Bytes())
+	}
+	if stream := body.Get("stream"); stream.Type != ojson.True {
+		t.Fatalf("stream = %s, want true: %s", stream.Raw, body.Bytes())
+	}
+}
+
+// The same doc-refresh contract on the streaming path: a marked request keeps
+// the normalized output budget instead of forwarding the raw translation.
+func TestCodexSessionInstructionsMarkerKeepsStreamDocEdits(t *testing.T) {
+	server, captured, _ := newCodexHostedImageTestServer(t, "http")
+	exec := NewCodexExecutor(&config.Config{})
+	req := core.Request{Model: "gpt-5.4", Payload: []byte(`{"input":"hi","instructions":" A ","max_output_tokens":8,"client_metadata":{"cpa_session_instructions":"start"}}`)}
+	result, errStream := exec.ExecuteStream(t.Context(), codexOAuthTestAuth(server.URL), req, managedInstructionsOptions(t))
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatal(chunk.Err)
+		}
+	}
+	body := ojson.NewDoc((<-captured).body)
+	if got := body.Get("max_output_tokens").Int(); got != int64(codexMinOutputTokens) {
+		t.Fatalf("max_output_tokens = %d, want clamped to %d: %s", got, codexMinOutputTokens, body.Bytes())
+	}
+}
+
+// The marker stands the chain cache down, so a previous_response_id with no
+// cached snapshot surfaces the session replay 409 instead of the chain-cache
+// previous_response_not_found 400, and never reaches the upstream.
+func TestCodexSessionInstructionsStreamMissingSnapshotReturnsFullContextConflict(t *testing.T) {
+	executor, auth, requests := newCodexChainFixture(t)
+	req := core.Request{Model: "gpt-5.4", Payload: []byte(`{"instructions":"B","input":[],"previous_response_id":"resp_missing","client_metadata":{"cpa_session_instructions":"start"}}`)}
+	_, err := executor.ExecuteStream(t.Context(), auth, req, managedInstructionsOptions(t))
+	var turnErr *core.UpstreamWebsocketTurnError
+	if !errors.As(err, &turnErr) || !turnErr.FullContextRequired {
+		t.Fatalf("error = %T %v, want full-context websocket turn error", err, err)
+	}
+	var errStatus interface{ StatusCode() int }
+	if !errors.As(err, &errStatus) || errStatus.StatusCode() != http.StatusConflict {
+		t.Fatalf("status = %v, want %d", err, http.StatusConflict)
+	}
+	if len(*requests) != 0 {
+		t.Fatalf("upstream requests = %d, want 0", len(*requests))
+	}
+}
+
 func newManagedInstructionsWSServer(t *testing.T) (*httptest.Server, <-chan []byte) {
 	t.Helper()
 	captured := make(chan []byte, 10)

@@ -201,10 +201,17 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts, auth))
 	helps.SetStringIfDifferentDoc(doc, "model", baseModel)
 	helps.SetBoolIfDifferentDoc(doc, "stream", true)
-	body, chainParentRespID, chainMissingRespID := helps.RepairCodexResponsesChainInputWithResult(doc.Bytes())
-	if chainMissingRespID != "" {
-		err = codexResponsesChainMissingErr(ctx, req.Payload, chainMissingRespID)
-		return resp, err
+	// Session-instructions traffic owns previous_response_id validation: an
+	// unproven incremental turn must fail with the session replay error, so the
+	// responses chain cache stands down when the marker is present.
+	var chainParentRespID string
+	if !helps.HasCodexSessionInstructionMarker(ojson.NewDoc(req.Payload), from) {
+		var chainMissingRespID string
+		body, chainParentRespID, chainMissingRespID = helps.RepairCodexResponsesChainInputWithResult(doc.Bytes())
+		if chainMissingRespID != "" {
+			err = codexResponsesChainMissingErr(ctx, req.Payload, chainMissingRespID)
+			return resp, err
+		}
 	}
 	doc = ojson.NewDoc(body)
 	_ = doc.Delete("previous_response_id")

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
 
@@ -223,6 +224,48 @@ func TestCodexExecutorExecuteStreamRebuildsPreviousResponseChain(t *testing.T) {
 	drain(codexChainTurn2Request)
 
 	assertCodexChainRebuiltSecondRequest(t, requests)
+}
+
+// Platform-only include values restored for API-key non-ChatGPT upstreams must
+// survive the turn-2 chain rebuild: the rebuild edits the same doc in place and
+// must not drop the earlier include preservation while replaying the cached
+// transcript.
+func TestCodexExecutorChainRebuildKeepsPlatformOnlyInclude(t *testing.T) {
+	turn1WithInclude := `{"model":"gpt-5.4","include":["file_search_call.results","message.output_text.logprobs"],"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"weather in SF?"}]}]}`
+	turn2WithInclude := `{"model":"gpt-5.4","previous_response_id":"resp_1","include":["file_search_call.results","message.output_text.logprobs"],"input":[{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}`
+	wantIncludes := []string{"reasoning.encrypted_content", "file_search_call.results", "message.output_text.logprobs"}
+	for _, mode := range []string{"execute", "stream"} {
+		t.Run(mode, func(t *testing.T) {
+			executor, auth, requests := newCodexChainFixture(t)
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}
+			for _, payload := range []string{turn1WithInclude, turn2WithInclude} {
+				req := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(payload)}
+				if mode == "execute" {
+					if _, err := executor.Execute(context.Background(), auth, req, opts); err != nil {
+						t.Fatal(err)
+					}
+					continue
+				}
+				result, err := executor.ExecuteStream(context.Background(), auth, req, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						t.Fatal(chunk.Err)
+					}
+				}
+			}
+			assertCodexChainRebuiltSecondRequest(t, requests)
+			second := (*requests)[1]
+			gotIncludes := parseIncludeStrings(second)
+			for _, want := range wantIncludes {
+				if !slices.Contains(gotIncludes, want) {
+					t.Fatalf("include %q lost after chain rebuild, got %v: %s", want, gotIncludes, second)
+				}
+			}
+		})
+	}
 }
 
 func TestCodexExecutorExecuteChainCacheMissReturnsPreviousResponseNotFound(t *testing.T) {

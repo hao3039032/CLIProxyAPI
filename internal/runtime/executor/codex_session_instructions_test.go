@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -109,9 +110,9 @@ func TestCodexSessionInstructionsHTTP(t *testing.T) {
 	}
 }
 
-// A marked request skips the responses chain rebuild, so body must be
-// refreshed from the edited doc in the else branch: the model-suffix thinking
-// effort and the Execute stream=true edit still have to reach the upstream.
+// A marked request skips the responses chain rebuild; the model-suffix
+// thinking effort and the Execute stream=true edit applied to the doc before
+// the marker check still have to reach the upstream.
 func TestCodexSessionInstructionsMarkerKeepsExecuteDocEdits(t *testing.T) {
 	server, captured, _ := newCodexHostedImageTestServer(t, "http")
 	exec := NewCodexExecutor(&config.Config{})
@@ -146,6 +147,42 @@ func TestCodexSessionInstructionsMarkerKeepsStreamDocEdits(t *testing.T) {
 	body := ojson.NewDoc((<-captured).body)
 	if got := body.Get("max_output_tokens").Int(); got != int64(codexMinOutputTokens) {
 		t.Fatalf("max_output_tokens = %d, want clamped to %d: %s", got, codexMinOutputTokens, body.Bytes())
+	}
+}
+
+// The marker-skip branch must also keep the include-preservation doc edits:
+// with an API-key non-ChatGPT backend, platform-only include values restored
+// before the marker check still reach the upstream on both HTTP paths.
+func TestCodexSessionInstructionsMarkerKeepsPlatformOnlyInclude(t *testing.T) {
+	wantIncludes := []string{"reasoning.encrypted_content", "file_search_call.results", "message.output_text.logprobs"}
+	for _, mode := range []string{"execute", "stream"} {
+		t.Run(mode, func(t *testing.T) {
+			server, captured, _ := newCodexHostedImageTestServer(t, "http")
+			exec := NewCodexExecutor(&config.Config{})
+			req := core.Request{Model: "gpt-5.4", Payload: []byte(`{"input":"hi","instructions":" A ","include":["file_search_call.results","message.output_text.logprobs"],"client_metadata":{"cpa_session_instructions":"start"}}`)}
+			if mode == "execute" {
+				if _, errExecute := exec.Execute(t.Context(), codexAPIKeyTestAuth(server.URL), req, managedInstructionsOptions(t)); errExecute != nil {
+					t.Fatal(errExecute)
+				}
+			} else {
+				result, errStream := exec.ExecuteStream(t.Context(), codexAPIKeyTestAuth(server.URL), req, managedInstructionsOptions(t))
+				if errStream != nil {
+					t.Fatal(errStream)
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						t.Fatal(chunk.Err)
+					}
+				}
+			}
+			body := (<-captured).body
+			gotIncludes := parseIncludeStrings(body)
+			for _, want := range wantIncludes {
+				if !slices.Contains(gotIncludes, want) {
+					t.Fatalf("include %q lost on the marker-skip path, got %v: %s", want, gotIncludes, body)
+				}
+			}
+		})
 	}
 }
 

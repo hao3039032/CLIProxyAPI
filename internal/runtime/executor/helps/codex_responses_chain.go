@@ -246,26 +246,44 @@ func RepairCodexResponsesChainInputWithResult(body []byte) (updated []byte, pare
 	if len(body) == 0 {
 		return body, "", ""
 	}
-	previous := ojson.GetBytes(body, "previous_response_id")
+	doc := ojson.NewDoc(body)
+	parentRespID, missingRespID = RepairCodexResponsesChainInputDoc(doc)
+	if parentRespID == "" {
+		return body, "", missingRespID
+	}
+	return doc.Bytes(), parentRespID, ""
+}
+
+// RepairCodexResponsesChainInputDoc is the *ojson.Doc form of
+// RepairCodexResponsesChainInputWithResult: it rebuilds the input in place on
+// the caller's doc so executors keep a single doc across mutation stages and
+// serialize only once at the final exit. It returns the resp id whose snapshot
+// was consumed (empty when the doc was left unchanged) and the resp id of a
+// missing snapshot.
+func RepairCodexResponsesChainInputDoc(doc *ojson.Doc) (parentRespID, missingRespID string) {
+	if doc == nil {
+		return "", ""
+	}
+	previous := doc.Get("previous_response_id")
 	if previous.Type != ojson.String {
-		return body, "", ""
+		return "", ""
 	}
 	respID := strings.TrimSpace(previous.String())
 	if respID == "" {
-		return body, "", ""
+		return "", ""
 	}
 	entry, ok := lookupCodexResponsesChainEntry(respID)
 	if !ok {
 		log.Infof("codex responses chain: cache miss for previous_response_id=%s", respID)
-		return body, "", respID
+		return "", respID
 	}
-	input := util.GetGJSONBytesNoCopy(body, "input")
+	input := doc.Get("input")
 	if !input.Exists() || !input.IsArray() {
-		return body, "", ""
+		return "", ""
 	}
 	items := input.Array()
 	if codexResponsesChainInputAlreadyReplayed(entry.outputItems, items) {
-		return body, "", ""
+		return "", ""
 	}
 	rebuilt := make([][]byte, 0, len(entry.inputItems)+len(entry.outputItems)+len(items))
 	rebuilt = append(rebuilt, entry.inputItems...)
@@ -280,12 +298,11 @@ func RepairCodexResponsesChainInputWithResult(body []byte) (updated []byte, pare
 	// across store:false turns) re-send items already present in the cached
 	// transcript; keep only the first occurrence of each id.
 	rebuilt = dedupeCodexResponsesChainItemsByID(rebuilt)
-	updated, errSet := ojson.SetRawBytes(body, "input", codexResponsesChainJoinItems(rebuilt))
-	if errSet != nil {
-		return body, "", ""
+	if errSet := doc.SetRawBytes("input", codexResponsesChainJoinItems(rebuilt)); errSet != nil {
+		return "", ""
 	}
 	log.Infof("codex responses chain: rebuilt input for previous_response_id=%s cachedInput=%d cachedOutput=%d newItems=%d rebuilt=%d", respID, len(entry.inputItems), len(entry.outputItems), len(items), len(rebuilt))
-	return updated, respID, ""
+	return respID, ""
 }
 
 // NewCodexResponsesChainMissingStatusErr builds the client-facing error for a
@@ -295,13 +312,12 @@ func RepairCodexResponsesChainInputWithResult(body []byte) (updated []byte, pare
 // error.param=previous_response_id, letting chaining clients (e.g. LangChain
 // agents) detect the stale id and retry with the full conversation history.
 func NewCodexResponsesChainMissingStatusErr(missingRespID string) (int, []byte) {
-	body, errBuild := ojson.SetBytes([]byte(`{"error":{}}`), "error.code", "previous_response_not_found")
-	if errBuild == nil {
-		body, _ = ojson.SetBytes(body, "error.type", "invalid_request_error")
-		body, _ = ojson.SetBytes(body, "error.param", "previous_response_id")
-		body, _ = ojson.SetBytes(body, "error.message", "No cached response found for previous_response_id '"+missingRespID+"'. This proxy forwards statelessly; after cache expiry or a restart the stored continuation is gone. Resend the full conversation input without previous_response_id to continue.")
-	}
-	return 400, body
+	doc := ojson.NewDocString(`{"error":{}}`)
+	_ = doc.Set("error.code", "previous_response_not_found")
+	_ = doc.Set("error.type", "invalid_request_error")
+	_ = doc.Set("error.param", "previous_response_id")
+	_ = doc.Set("error.message", "No cached response found for previous_response_id '"+missingRespID+"'. This proxy forwards statelessly; after cache expiry or a restart the stored continuation is gone. Resend the full conversation input without previous_response_id to continue.")
+	return 400, doc.Bytes()
 }
 
 // ClearCodexResponsesChainCache resets all in-memory and on-disk snapshots.
@@ -314,7 +330,7 @@ func ClearCodexResponsesChainCache() {
 	if entries, errList := os.ReadDir(codexResponsesChainDir); errList == nil {
 		for _, entry := range entries {
 			name := entry.Name()
-			if strings.HasSuffix(name, codexResponsesChainDiskExt) || strings.HasSuffix(name, codexResponsesChainDiskLegacyExt) {
+			if strings.HasSuffix(name, codexResponsesChainDiskExt) || strings.HasSuffix(name, codexResponsesChainDiskLegacyExt) || strings.HasSuffix(name, ".tmp") {
 				_ = os.Remove(filepath.Join(codexResponsesChainDir, name))
 			}
 		}
@@ -448,12 +464,25 @@ func writeCodexResponsesChainDisk(respID string, inputItems, outputItems [][]byt
 		compressed = codexResponsesChainGzipCompress(payload)
 	}
 	path := filepath.Join(codexResponsesChainDir, respID+codexResponsesChainDiskExt)
-	tmp := path + ".tmp"
-	if errWrite := os.WriteFile(tmp, compressed, 0o600); errWrite != nil {
+	// Unique temp name: concurrent writers of the same resp id must not share
+	// a fixed .tmp path or they interleave bytes before the rename. CreateTemp
+	// creates the file with 0o600 permissions.
+	tmpFile, errTmp := os.CreateTemp(codexResponsesChainDir, respID+".*.tmp")
+	if errTmp != nil {
 		return false
 	}
-	if errRename := os.Rename(tmp, path); errRename != nil {
-		_ = os.Remove(tmp)
+	tmpPath := tmpFile.Name()
+	if _, errWrite := tmpFile.Write(compressed); errWrite != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return false
+	}
+	if errClose := tmpFile.Close(); errClose != nil {
+		_ = os.Remove(tmpPath)
+		return false
+	}
+	if errRename := os.Rename(tmpPath, path); errRename != nil {
+		_ = os.Remove(tmpPath)
 		return false
 	}
 	return true
@@ -635,6 +664,14 @@ func sweepCodexResponsesChainDisk(now time.Time) {
 	var totalBytes int64
 	for _, entry := range entries {
 		name := entry.Name()
+		if strings.HasSuffix(name, ".tmp") {
+			// Orphaned temp file from a crashed write; only reap stale ones so
+			// an in-flight concurrent write is never pulled from under its rename.
+			if info, errInfo := entry.Info(); errInfo == nil && now.Sub(info.ModTime()) > codexResponsesChainPurgeInterval {
+				_ = os.Remove(filepath.Join(codexResponsesChainDir, name))
+			}
+			continue
+		}
 		if !strings.HasSuffix(name, codexResponsesChainDiskExt) && !strings.HasSuffix(name, codexResponsesChainDiskLegacyExt) {
 			continue
 		}

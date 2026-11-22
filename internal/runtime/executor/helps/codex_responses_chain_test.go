@@ -323,10 +323,11 @@ func TestCodexResponsesChainFoldKeepsParentDiskWhenSuccessorWriteFails(t *testin
 		t.Fatalf("parent snapshot missing before fold: %v", errStat)
 	}
 
-	// Occupy the successor's tmp path with a directory so only its write fails
-	// (writing to a directory returns EISDIR) while removes still work, the
-	// shape of a transient write failure such as a full disk.
-	if errMkdir := os.Mkdir(filepath.Join(dir, "resp_2"+codexResponsesChainDiskExt+".tmp"), 0o700); errMkdir != nil {
+	// Occupy the successor's final snapshot path with a directory so only its
+	// rename fails (renaming a file onto a directory returns EISDIR) while
+	// removes still work, the shape of a transient write failure such as a
+	// full disk. The unique temp file itself must be cleaned up afterwards.
+	if errMkdir := os.Mkdir(filepath.Join(dir, "resp_2"+codexResponsesChainDiskExt), 0o700); errMkdir != nil {
 		t.Fatalf("mkdir blocker: %v", errMkdir)
 	}
 
@@ -346,6 +347,15 @@ func TestCodexResponsesChainFoldKeepsParentDiskWhenSuccessorWriteFails(t *testin
 	}
 	if _, errStat := os.Stat(parentPath); errStat != nil {
 		t.Fatalf("parent disk file must survive a failed successor write: %v", errStat)
+	}
+	entries, errList := os.ReadDir(dir)
+	if errList != nil {
+		t.Fatalf("list snapshot dir: %v", errList)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".tmp") {
+			t.Fatalf("failed write left orphan tmp file %s", entry.Name())
+		}
 	}
 
 	// After memory loss the parent snapshot is still recoverable from disk.
@@ -492,15 +502,89 @@ func TestCodexResponsesChainCacheEvictsBeyondMaxEntries(t *testing.T) {
 	}
 
 	first := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_0","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
-	// resp_0 is evicted from memory but its disk file survives; wipe memory
-	// is not needed - assert only the in-memory bound here.
+	// resp_0 is the least-recently-used entry and must have been evicted from
+	// the in-memory map once the entry bound was exceeded.
 	codexResponsesChainMu.Lock()
 	entries := len(codexResponsesChainEntries)
+	_, firstInMemory := codexResponsesChainEntries["resp_0"]
 	codexResponsesChainMu.Unlock()
 	if entries > CodexResponsesChainCacheMaxEntries {
 		t.Fatalf("entries = %d, want <= %d", entries, CodexResponsesChainCacheMaxEntries)
 	}
-	_ = first
+	if firstInMemory {
+		t.Fatalf("resp_0 should have been evicted from the in-memory map")
+	}
+	// The authoritative disk copy survives the memory eviction: the rebuild
+	// still succeeds through the disk fallback (which re-promotes the entry).
+	updated := RepairCodexResponsesChainInput(first)
+	items := ojson.GetBytes(updated, "input").Array()
+	if len(items) != 3 {
+		t.Fatalf("input items = %d, want 3 via disk fallback after eviction: %s", len(items), updated)
+	}
+	if got := items[1].Get("id").String(); got != "msg_0" {
+		t.Fatalf("items[1].id = %q, want msg_0 from the evicted snapshot", got)
+	}
+}
+
+// Concurrent writers of the same resp id must not corrupt the snapshot: each
+// write uses a unique temp file and the atomic rename leaves exactly one
+// readable record matching one of the written variants.
+func TestCodexResponsesChainConcurrentSameRespIDDiskWrites(t *testing.T) {
+	dir := resetCodexResponsesChainForTest(t)
+	now := codexResponsesChainNow()
+	inputItems := [][]byte{[]byte(`{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}`)}
+	const writers = 8
+	var wg sync.WaitGroup
+	for worker := 0; worker < writers; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				outputItems := [][]byte{[]byte(fmt.Sprintf(`{"type":"message","id":"msg_w%d","content":[{"type":"output_text","text":"variant %d"}]}`, worker, worker))}
+				if !writeCodexResponsesChainDisk("resp_shared", inputItems, outputItems, now) {
+					t.Errorf("worker %d: disk write failed", worker)
+					return
+				}
+			}
+		}(worker)
+	}
+	wg.Wait()
+
+	record, ok := readCodexResponsesChainDisk("resp_shared", now)
+	if !ok {
+		t.Fatalf("snapshot unreadable after concurrent same-id writes")
+	}
+	if len(record.Input) != 1 || len(record.Output) != 1 {
+		t.Fatalf("record items = %d/%d, want 1/1", len(record.Input), len(record.Output))
+	}
+	gotID := ojson.GetBytes(record.Output[0], "id").String()
+	gotText := ojson.GetBytes(record.Output[0], "content.0.text").String()
+	matched := false
+	for worker := 0; worker < writers; worker++ {
+		if gotID == fmt.Sprintf("msg_w%d", worker) && gotText == fmt.Sprintf("variant %d", worker) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		t.Fatalf("surviving snapshot is not any written variant: id=%q text=%q", gotID, gotText)
+	}
+	entries, errList := os.ReadDir(dir)
+	if errList != nil {
+		t.Fatalf("list snapshot dir: %v", errList)
+	}
+	snapshots := 0
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".tmp") {
+			t.Fatalf("concurrent writes left orphan tmp file %s", entry.Name())
+		}
+		if strings.HasSuffix(entry.Name(), codexResponsesChainDiskExt) {
+			snapshots++
+		}
+	}
+	if snapshots != 1 {
+		t.Fatalf("snapshot files = %d, want exactly 1", snapshots)
+	}
 }
 
 func TestCodexResponsesChainConcurrentRecordAndRepair(t *testing.T) {
